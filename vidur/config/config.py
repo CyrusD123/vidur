@@ -302,6 +302,28 @@ class VllmSchedulerConfig(BaseReplicaSchedulerConfig):
 
 
 @dataclass
+class RlVllmSchedulerConfig(VllmSchedulerConfig):
+    priority_policy: str = field(
+        default="fcfs",
+        metadata={
+            "help": "Priority policy used to rank the waiting queue. "
+            "Can be overridden at runtime via set_priority_policy()."
+        },
+    )
+    num_priority_levels: int = field(
+        default=8,
+        metadata={
+            "help": "Number of priority levels. Priorities are integers in "
+            "[0, num_priority_levels), lower is scheduled first."
+        },
+    )
+
+    @staticmethod
+    def get_type():
+        return ReplicaSchedulerType.RL_VLLM
+
+
+@dataclass
 class LightllmSchedulerConfig(BaseReplicaSchedulerConfig):
     max_tokens_in_batch: int = field(
         default=4096,

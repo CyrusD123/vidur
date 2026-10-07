@@ -37,7 +37,7 @@ class GlobalScheduleEvent(BaseEvent):
         return {
             "time": self.time,
             "event_type": self.event_type,
-            "replica_set": self._replica_set,
+            "replica_set": sorted(self._replica_set),
             "request_mapping": [
                 (replica_id, request.id)
                 for replica_id, request in self._request_mapping
