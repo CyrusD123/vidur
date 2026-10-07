@@ -274,9 +274,26 @@ class BaseReplicaSchedulerConfig(BasePolyConfig):
 
 @dataclass
 class VllmSchedulerConfig(BaseReplicaSchedulerConfig):
-    max_tokens_in_batch: int = field(
-        default=4096,
-        metadata={"help": "Maximum tokens in batch for vLLM."},
+    # Defaults mirror vLLM V1 on A100 with the OpenAI API server.
+    batch_size_cap: int = field(
+        default=256,
+        metadata={"help": "Maximum number of running requests (vLLM max_num_seqs)."},
+    )
+    watermark_blocks_fraction: float = field(
+        default=0.0,
+        metadata={"help": "Watermark blocks fraction (vLLM watermark)."},
+    )
+    max_num_batched_tokens: int = field(
+        default=2048,
+        metadata={
+            "help": "Maximum tokens processed per iteration; longer prefills are chunked."
+        },
+    )
+    long_prefill_token_threshold: int = field(
+        default=0,
+        metadata={
+            "help": "Cap on prefill tokens per request per iteration. 0 disables the cap."
+        },
     )
 
     @staticmethod
@@ -529,7 +546,7 @@ class BaseExecutionTimePredictorConfig(BasePolyConfig):
         metadata={"help": "Max prefill chunk size for prediction."},
     )
     prediction_max_batch_size: int = field(
-        default=128,
+        default=256,
         metadata={"help": "Max batch size for prediction."},
     )
     prediction_max_tokens_per_request: int = field(
@@ -618,7 +635,7 @@ class ClusterConfig:
         metadata={"help": "Global scheduler config."},
     )
     replica_scheduler_config: BaseReplicaSchedulerConfig = field(
-        default_factory=SarathiSchedulerConfig,
+        default_factory=VllmSchedulerConfig,
         metadata={"help": "Replica scheduler config."},
     )
 

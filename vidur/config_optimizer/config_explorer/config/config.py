@@ -48,7 +48,7 @@ class TraceConfig:
             "trace_request_length_generator_config_prefill_scale_factor": 1,
             "trace_request_length_generator_config_decode_scale_factor": 1,
             "synthetic_request_generator_config_num_requests": self.num_requests,
-            "vllm_scheduler_config_max_tokens_in_batch": self.max_seq_len,
+            "vllm_scheduler_config_max_num_batched_tokens": self.max_seq_len,
         }
 
 

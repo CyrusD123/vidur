@@ -119,6 +119,8 @@ python -m vidur.main  \
 --random_forrest_execution_time_predictor_config_prediction_max_tokens_per_request 16384
 ```
 
+The default replica scheduler is `vllm`, which models the vLLM V1 scheduler: chunked prefill under a per-iteration token budget (`--vllm_scheduler_config_max_num_batched_tokens`, default 2048), running requests scheduled before waiting ones, and preemption by recomputation. Its defaults (`batch_size_cap` 256, `watermark_blocks_fraction` 0) follow vLLM on A100 with the OpenAI API server. Prefix caching, speculative decoding, async scheduling and pipelining of consecutive prefill chunks across pipeline stages are not modelled.
+
 or to get information on all parameters,
 
 ```sh
