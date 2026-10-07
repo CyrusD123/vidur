@@ -49,7 +49,7 @@ def _scheduler_args(scheduler_type: str) -> list:
     return [
         "--replica_scheduler_config_type", scheduler_type,
         f"--{prefix}_scheduler_config_batch_size_cap", "128",
-        f"--{prefix}_scheduler_config_max_tokens_in_batch", "4096",
+        f"--{prefix}_scheduler_config_max_num_batched_tokens", "2048",
         # small KV cache (64k tokens) so the preempt/restart path runs
         f"--{prefix}_scheduler_config_num_blocks", "4000",
     ]  # fmt: skip
