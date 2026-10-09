@@ -1,28 +1,39 @@
 from abc import ABC, abstractmethod
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from vidur.config import SimulationConfig
 from vidur.entities import Replica, Request
-from vidur.execution_time_predictor import ExecutionTimePredictorRegistry
+from vidur.execution_time_predictor import (
+    BaseExecutionTimePredictor,
+    ExecutionTimePredictorRegistry,
+)
 from vidur.scheduler.replica_scheduler.replica_scheduler_registry import (
     ReplicaSchedulerRegistry,
 )
 
 
 class BaseGlobalScheduler(ABC):
-    def __init__(self, config: SimulationConfig, replicas: Dict[int, Replica]):
+    def __init__(
+        self,
+        config: SimulationConfig,
+        replicas: Dict[int, Replica],
+        execution_time_predictor: Optional[BaseExecutionTimePredictor] = None,
+    ):
         self._config = config
         self._replicas = replicas
 
         self._num_replicas = len(self._replicas)
 
-        execution_time_predictor = ExecutionTimePredictorRegistry.get(
-            config.execution_time_predictor_config.get_type(),
-            predictor_config=config.execution_time_predictor_config,
-            replica_config=config.cluster_config.replica_config,
-            replica_scheduler_config=config.cluster_config.replica_scheduler_config,
-            metrics_config=config.metrics_config,
-        )
+        # building the predictor loads (or trains) its models, so callers that run
+        # many simulations with the same config can pass a prebuilt one
+        if execution_time_predictor is None:
+            execution_time_predictor = ExecutionTimePredictorRegistry.get(
+                config.execution_time_predictor_config.get_type(),
+                predictor_config=config.execution_time_predictor_config,
+                replica_config=config.cluster_config.replica_config,
+                replica_scheduler_config=config.cluster_config.replica_scheduler_config,
+                metrics_config=config.metrics_config,
+            )
         self._replica_schedulers = {
             replica_id: ReplicaSchedulerRegistry.get(
                 config.cluster_config.replica_scheduler_config.get_type(),

@@ -1,11 +1,12 @@
 import atexit
 import heapq
 import json
-from typing import List
+from typing import List, Optional
 
 from vidur.config import SimulationConfig
 from vidur.entities import Cluster
 from vidur.events import BaseEvent, RequestArrivalEvent
+from vidur.execution_time_predictor import BaseExecutionTimePredictor
 from vidur.logger import init_logger
 from vidur.metrics import MetricsStore
 from vidur.request_generator import RequestGeneratorRegistry
@@ -15,7 +16,11 @@ logger = init_logger(__name__)
 
 
 class Simulator:
-    def __init__(self, config: SimulationConfig) -> None:
+    def __init__(
+        self,
+        config: SimulationConfig,
+        execution_time_predictor: Optional[BaseExecutionTimePredictor] = None,
+    ) -> None:
         self._config: SimulationConfig = config
 
         self._time = 0
@@ -43,6 +48,7 @@ class Simulator:
             self._config.cluster_config.global_scheduler_config.get_type(),
             self._config,
             self._cluster.replicas,
+            execution_time_predictor=execution_time_predictor,
         )
 
         self._init_event_queue()

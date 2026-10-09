@@ -30,6 +30,14 @@ class BasePriorityPolicy(ABC):
         """
         pass
 
+    def on_batch_formed(self, admitted_requests: List[Request]) -> None:
+        """
+        Called after every get_priorities() call, once the batch is formed, with
+        the waiting requests that were admitted. If none were, the ranking had no
+        effect and the scheduler has already restored the previous queue order.
+        """
+        pass
+
 
 class FCFSPriorityPolicy(BasePriorityPolicy):
     """Every request gets the same priority, so the stable sort keeps FCFS order."""
