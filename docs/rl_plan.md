@@ -556,8 +556,19 @@ None from FCFS episodes).
 **5. `TorchAgent(BaseAgent)`** (`vidur/rl/torch_agent.py`, implemented)
 - One forward pass per decision, policy only: about 1 ms on CPU, about 1.5 s per
   300-request episode.
-- Sampling uses a private `torch.Generator`. `deterministic=True` takes each
-  request's most likely level.
+- `decoding` turns the per-request level distributions into one ranking:
+  - `sample`: each request's level is drawn independently, with a private
+    `torch.Generator`. Training rollouts use this; PPO needs the randomness to
+    compare actions and to compute log-probs.
+  - `argmax`: each request's most likely level. Too coarse to evaluate with:
+    while the scores stay inside the middle level's interval (±1.95 at
+    initialization), every request still gets the middle level, so the
+    policy is exactly FCFS whatever it has learned.
+  - `rank` (eval default): sort requests by expected level
+    E[a] = Σ_c σ(s − θ_c), which for the ordinal head is the same order as the
+    raw scores (ties by arrival), then cut the ranking into L equal groups.
+    Every score difference changes the order. The untrained policy is still
+    FCFS (all scores equal).
 - It doesn't store log-probs. The coarsened log-prob depends on what was
   admitted, so PPO recomputes it from the rollout weights before the first
   update. That's exact for synchronous PPO, where workers act with the same
@@ -594,8 +605,16 @@ None from FCFS episodes).
 - Logs go to `<output_dir>/metrics.jsonl`, plus wandb with `wandb: true`.
   Metrics are overall and per workload: return, improvement over FCFS, mean gap
   closed, latency tails, decision time, and the PPO stats.
-- `best.pt` (by eval improvement over FCFS) and `latest.pt` are saved every
-  `eval_every` iterations.
+- Every `eval_every` iterations the policy runs on the eval seeds with each
+  decoding in `eval_decodings` (default `rank`, `argmax`, `sample`), logged as
+  `eval/<decoding>/...`.
+- `train/...` metrics come from the sampled training rollouts, so they include
+  exploration noise. Read them as "is the training signal moving", and the
+  `eval/rank/...` metrics as "what we would deploy".
+- `best.pt` (by improvement over FCFS under `select_decoding`, default `rank`)
+  and `latest.pt` are saved at each eval. With `keep_eval_checkpoints`
+  (default on) every eval's weights also go to `checkpoints/iter_<n>.pt`, so
+  past iterations can be re-scored offline.
 - Still to do: add ShareGPT/Azure traces to the mix (`simulation.trace_file`
   per workload).
 
@@ -605,9 +624,10 @@ throughput, fairness, and policy inference time per decision. Export via
 TorchScript/ONNX for the vLLM deployment.
 
 *Implemented:* `python -m vidur.rl.evaluate --checkpoint run/best.pt [--workload
-'{name: ..., qps: ...}'] [--seeds ...] [--sampled]`. It runs the deterministic
-(and optionally sampled) policy and the baselines (FCFS, SJF variants, aging SJF)
-on held-out seeds. For each workload it reports:
+'{name: ..., qps: ...}'] [--seeds ...] [--decodings rank argmax sample]`. It runs
+the policy with each decoding (default `rank` and `argmax`, reported as
+`policy_<decoding>`) and the baselines (FCFS, SJF variants, aging SJF) on
+held-out seeds. For each workload it reports:
 - Improvement over FCFS under the training reward.
 - Mean gap closed.
 - Mean/p99 e2e and TTFT, and p99 TBT.
@@ -730,6 +750,99 @@ placeholder features.
   e.g. 100-request episodes, where it reached ~40. Use it on full-size
   episodes, or read it alongside improvement over FCFS.
 - `ObservationConfig` pickles by feature names, so it can go to spawned workers.
+
+### First training run and fixes (60 iterations, default config)
+
+The first run used a near-uniform initial policy and per-batch advantage
+normalization (`rl_runs/first_run`).
+- **The sampled policy's cost fell steadily** relative to FCFS: −0.63 → −0.15 at
+  qps10_blocks4000, and −0.023 → 0 at qps20.
+- **Entropy stayed near uniform** (2.60 against a maximum of 2.77), and the
+  deterministic policy only just started to leave FCFS. The best eval was
+  +0.011 over FCFS at iteration 50, against about +0.09 for aging SJF.
+- **Updates took about 57 s per iteration**, against about 11 s of rollouts.
+
+Changes:
+- **Start near FCFS** (`ModelConfig.init_middle_level_prob`, default 0.75).
+  - Each request starts with 75% of its probability on the middle level and the
+    rest on nearby levels. The untrained deterministic policy is still FCFS.
+  - Exploration is now small reorderings around FCFS rather than random
+    rankings. The fork experiment showed random rankings have a poor
+    signal-to-noise ratio, and they are heavily penalized by the tail term.
+- **Per-workload advantage normalization** (`PPOConfig.advantage_normalization:
+  workload`). Random reordering moved the cost about 0.6 at qps10_blocks4000 but
+  about 0.02 at qps20, so with batch normalization the memory-pressure
+  workload's noise drowned out qps20's signal.
+- **Faster updates.** Profiling showed the update was pure model compute, mostly
+  attention over states of up to ~250 tokens.
+  - The learner runs on MPS/CUDA (`PPOConfig.device: auto`). Rollout workers
+    stay on CPU.
+  - Length-bucketed minibatches (`bucket_by_length`).
+  - Fused or multi-tensor Adam (`make_optimizer`).
+  - Per-step stats stay on the device, synced once per epoch.
+  - Result: about 1.7× faster for the same work. A 7,400-sample batch drops
+    from ≈57 s to an estimated ≈34 s on an M-series GPU (measured 14 s per
+    3,100 samples). `ppo.epochs: 2` would halve it again.
+  - Measured but not worth it: larger minibatches (slower on MPS), padding to
+    multiples of 32 (no effect).
+  - MPS and CPU updates agree to 4 digits.
+- `update_s` is now broken into phases in the PPO stats (`prepare_s`,
+  `old_log_prob_s`, `epochs_s`).
+
+### Run 2 (200 iterations, with the fixes above) and eval decoding
+
+`rl_runs/run2`: near-FCFS initialization, per-workload advantage normalization,
+MPS learner (about 11 s of rollouts + 28 s of update per iteration).
+
+**Training (sampled policy) vs FCFS**, means over 20-iteration windows:
+
+| iterations | qps10_blocks4000 | qps20 | entropy | approx KL |
+|---|---|---|---|---|
+| 1–20 | −0.142 | −0.001 | 0.77 | 0.003 |
+| 41–60 | +0.011 | +0.007 | 0.79 | 0.014 |
+| 101–120 | +0.002 | +0.016 | 0.81 | 0.022 |
+| 141–160 | −0.012 | +0.029 | 0.82 | 0.030 |
+| 181–200 | −0.121 | +0.041 | 0.85 | 0.044 |
+
+- qps20 improved steadily. qps10_blocks4000 regressed after about iteration
+  160, while qps20 kept gaining.
+- Entropy rose and approximate KL climbed toward `target_kl` (0.05). The
+  iteration-180 update stopped early, and the argmax eval dropped to −0.47 at
+  qps10_blocks4000 at the same point.
+
+**The argmax eval hid the learning.** It read exactly 0.000 for iterations
+10–130: the scores had moved, but not past the middle level's cutpoints. A
+check on the iteration-40 checkpoint (5 eval seeds) gave argmax 0.000,
+sampled −0.035 and expected-level rank +0.124 at qps10_blocks4000. So the
+eval now uses `rank` decoding (step 5), logs all three decodings, and selects
+`best.pt` by `rank`.
+
+**Run 2's saved checkpoints re-scored** (`evaluate --decodings rank argmax
+sample`, 5 eval seeds; improvement over FCFS / mean gap closed):
+
+| checkpoint | decoding | qps10_blocks4000 | qps20 |
+|---|---|---|---|
+| iter 140 (`best.pt`) | rank | +0.095 ± 0.050 / 0.54 | +0.065 ± 0.010 / 0.42 |
+| | argmax | +0.027 / 0.02 | 0.000 / 0.00 |
+| | sample | +0.059 / 0.40 | +0.027 / 0.18 |
+| iter 200 (`latest.pt`) | rank | +0.009 ± 0.088 / 0.49 | +0.075 ± 0.015 / 0.44 |
+| | argmax | −0.251 / 0.15 | +0.006 / 0.05 |
+| | sample | −0.021 / 0.49 | +0.044 / 0.26 |
+| baseline | aging SJF (total_tokens, 400) | +0.124 / 0.37 | +0.077 / 0.46 |
+
+- With `rank`, the iteration-140 policy is close to aging SJF on both
+  workloads. At qps10_blocks4000 it closes more of the FCFS-to-SJF mean gap
+  than aging SJF (0.54 vs 0.37), but its p99 e2e is worse (36.3 s vs 35.5 s,
+  FCFS 34.8 s), so its reward is lower.
+- At iteration 200, qps20 is at aging SJF's level, but qps10_blocks4000 is back
+  near FCFS with high variance across seeds, the same regression as the
+  training curve.
+- Only `best.pt` and `latest.pt` were saved in run 2. Runs now keep every
+  eval's checkpoint.
+- Next, not done yet: steadier late training (lower learning rate or a decay,
+  `entropy_coef` 0.003 → 0.001, possibly `ppo.epochs: 2`) and a
+  qps10_blocks4000-only run to separate interference between workloads from
+  the difficulty of that workload.
 
 ## 7. Open decisions
 

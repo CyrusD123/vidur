@@ -41,12 +41,19 @@ class ModelConfig:
     # get the last priority level and no gradient), running requests from the end
     max_queue_len: int = 128
     max_running_len: int = 128
+    # How concentrated the untrained policy is. Every request starts with this
+    # probability on the middle level (its most likely level, so the untrained
+    # deterministic policy is FCFS), the rest spread over nearby levels (ordinal)
+    # or all other levels (categorical). High values start training near FCFS,
+    # exploring small reorderings; 1 / num_priority_levels is roughly uniform.
+    init_middle_level_prob: float = 0.75
 
     def __post_init__(self):
         assert self.encoder in ENCODERS, f"encoder must be one of {ENCODERS}"
         assert self.head in HEADS, f"head must be one of {HEADS}"
         assert self.num_priority_levels >= 2
         assert self.d_model % self.num_heads == 0
+        assert 0 < self.init_middle_level_prob < 1
 
 
 # ---------------------------------------------------------------------------
@@ -84,12 +91,21 @@ def collate(
     observations: Sequence[Observation],
     config: ModelConfig,
     modeled: Optional[Sequence[np.ndarray]] = None,
+    pad_to_multiple: int = 1,
 ) -> ObsBatch:
+    """
+    Pad a batch of observations. pad_to_multiple rounds the padded lengths up,
+    so a GPU sees few distinct shapes (MPS rebuilds its graph for each one).
+    """
     if modeled is None:
         modeled = [modeled_indices(o, config.max_queue_len) for o in observations]
     batch = len(observations)
-    nw = max(1, max(len(m) for m in modeled))
-    nr = max(1, max(min(o.num_running, config.max_running_len) for o in observations))
+
+    def padded(n: int) -> int:
+        return -(-max(1, n) // pad_to_multiple) * pad_to_multiple
+
+    nw = padded(max(len(m) for m in modeled))
+    nr = padded(max(min(o.num_running, config.max_running_len) for o in observations))
 
     waiting = np.zeros((batch, nw, config.num_waiting_features), np.float32)
     waiting_mask = np.zeros((batch, nw), bool)
@@ -363,13 +379,14 @@ class SchedulerModel(nn.Module):
         num_levels = config.num_priority_levels
         if config.head == "ordinal":
             self.score_head = _mlp(d, 1, d)
-            # cutpoints: first one free, then positive increments (softplus);
-            # initialized evenly spread so a score of 0 is roughly uniform
-            self.cutpoint_start = nn.Parameter(
-                torch.tensor(-(num_levels - 2) / 2 * 0.5)
-            )
+            # cutpoints: first one free, then positive increments (softplus).
+            # Evenly spaced by s with the middle level m between -s/2 and s/2,
+            # so a score of 0 puts P(a = m) = tanh(s / 4) = init_middle_level_prob
+            middle = (num_levels - 1) // 2
+            spacing = 4 * math.atanh(config.init_middle_level_prob)
+            self.cutpoint_start = nn.Parameter(torch.tensor((0.5 - middle) * spacing))
             self.cutpoint_increments = nn.Parameter(
-                torch.full((num_levels - 2,), math.log(math.expm1(0.5)))
+                torch.full((num_levels - 2,), math.log(math.expm1(spacing - 1e-3)))
             )
         else:
             self.logit_head = _mlp(d, num_levels, d)
@@ -385,6 +402,13 @@ class SchedulerModel(nn.Module):
         for layer in last_layers:
             nn.init.zeros_(layer.weight)
             nn.init.zeros_(layer.bias)
+        if config.head == "categorical":
+            # softmax puts init_middle_level_prob on the middle level
+            p = config.init_middle_level_prob
+            with torch.no_grad():
+                self.logit_head[-1].bias[(num_levels - 1) // 2] = math.log(
+                    p * (num_levels - 1) / (1 - p)
+                )
 
     def cutpoints(self) -> torch.Tensor:
         increments = F.softplus(self.cutpoint_increments) + 1e-3

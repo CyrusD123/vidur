@@ -6,8 +6,9 @@ Evaluate a trained policy against baselines on held-out seeds
     python -m vidur.rl.evaluate --checkpoint ... --seeds 2000000 2000001 \\
         --workload '{name: qps15, qps: 15, num_blocks: 6000}'
 
-For each workload and seed it runs the policy (deterministic, and optionally
-sampled) and the baselines, and reports per workload: improvement over FCFS
+For each workload and seed it runs the policy with each decoding in
+--decodings (policy_rank, policy_argmax, policy_sample; see TorchAgent) and
+the baselines, and reports per workload: improvement over FCFS
 under the training reward, the fraction of the FCFS-to-SJF mean gap closed,
 mean/p99 latencies, and the policy's inference time per decision.
 """
@@ -20,6 +21,7 @@ import yaml
 
 from vidur.rl.reward import episode_cost
 from vidur.rl.rollout import RolloutRunner, RolloutTask, WorkloadConfig
+from vidur.rl.torch_agent import DECODINGS
 from vidur.rl.train import TrainConfig, load_checkpoint
 
 DEFAULT_BASELINES = (
@@ -45,7 +47,7 @@ def evaluate(
     workloads: Sequence[WorkloadConfig] = (),
     seeds: Sequence[int] = (),
     baselines: Sequence[str] = DEFAULT_BASELINES,
-    sampled: bool = False,
+    decodings: Sequence[str] = ("rank", "argmax"),
 ) -> pd.DataFrame:
     """One row per (workload, seed, policy)."""
     checkpoint = load_checkpoint(checkpoint_path)
@@ -63,21 +65,21 @@ def evaluate(
     )
     runner.model.load_state_dict(model.state_dict())
 
-    policies = [("policy", True)] + ([("policy_sampled", False)] if sampled else [])
+    assert set(decodings) <= set(DECODINGS), f"decodings must be in {DECODINGS}"
     rows: List[Dict] = []
     for workload in workloads:
         env = runner.env(workload.name)
         for seed in seeds:
             fcfs = env.reference_episode("fcfs", seed)
-            for name, deterministic in policies:
+            for decoding in decodings:
                 trajectory = runner.run(
-                    RolloutTask(workload.name, seed, 0, seed, deterministic)
+                    RolloutTask(workload.name, seed, 0, seed, decoding)
                 )
                 rows.append(
                     {
                         "workload": workload.name,
                         "seed": seed,
-                        "policy": name,
+                        "policy": f"policy_{decoding}",
                         "improvement_over_fcfs": trajectory.improvement_over_fcfs,
                         "mean_gap_closed": trajectory.mean_gap_closed,
                         "decision_ms": 1e3 * trajectory.decision_time_s,
@@ -117,13 +119,15 @@ def main() -> None:
         "--workload", action="append", default=[], help="YAML/JSON WorkloadConfig"
     )
     parser.add_argument("--baselines", nargs="*", default=list(DEFAULT_BASELINES))
-    parser.add_argument("--sampled", action="store_true", help="also run sampled")
+    parser.add_argument(
+        "--decodings", nargs="*", default=["rank", "argmax"], choices=DECODINGS
+    )
     parser.add_argument("--output", default=None, help="CSV of all rows")
     args = parser.parse_args()
 
     workloads = [WorkloadConfig(**yaml.safe_load(w)) for w in args.workload]
     table = evaluate(
-        args.checkpoint, workloads, args.seeds, args.baselines, args.sampled
+        args.checkpoint, workloads, args.seeds, args.baselines, args.decodings
     )
     if args.output:
         table.to_csv(args.output, index=False)

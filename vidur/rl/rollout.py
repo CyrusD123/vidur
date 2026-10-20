@@ -63,7 +63,8 @@ class RolloutTask:
     # index within the group of rollouts on this (workload, seed)
     rollout_index: int
     agent_seed: int
-    deterministic: bool = False
+    # TorchAgent decoding: "sample" (training), "argmax" or "rank"
+    decoding: str = "sample"
 
 
 @dataclass
@@ -121,7 +122,7 @@ class RolloutRunner:
 
     def run(self, task: RolloutTask) -> Trajectory:
         env = self.env(task.workload)
-        agent = TorchAgent(self.model, task.agent_seed, task.deterministic)
+        agent = TorchAgent(self.model, task.agent_seed, task.decoding)
         episode = env.run_episode(agent, workload_seed=task.workload_seed)
 
         fcfs = env.reference_episode("fcfs", task.workload_seed)

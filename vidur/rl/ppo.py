@@ -19,6 +19,7 @@ PPO for the queue-ranking scheduler (docs/rl_plan.md §3, §4, §6 step 6).
 """
 
 import math
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
@@ -30,6 +31,17 @@ from vidur.rl.model import SchedulerModel, collate, interval_targets, modeled_in
 from vidur.rl.rollout import Trajectory
 
 ADVANTAGE_MODES = ("group", "gae")
+ADVANTAGE_NORMALIZATIONS = ("workload", "batch", "none")
+STEP_STATS = (
+    "policy_loss",
+    "value_loss",
+    "request_value_loss",
+    "entropy",
+    "approx_kl",
+    "clip_fraction",
+    "grad_norm",
+    "value_grad_norm",
+)
 
 
 @dataclass
@@ -46,14 +58,32 @@ class PPOConfig:
     request_value_coef: float = 0.5
     entropy_coef: float = 0.003
     max_grad_norm: float = 0.5
+    # Build minibatches from states of similar size (number of tokens), so less
+    # attention compute goes to padding; minibatch order is still shuffled.
+    # The jitter (in tokens) varies minibatch composition between epochs.
+    bucket_by_length: bool = True
+    # learner device: "auto" picks cuda, then mps, then cpu. Rollout workers
+    # always act on CPU.
+    device: str = "auto"
+    # round padded token counts up to this multiple (fewer distinct shapes)
+    pad_to_multiple: int = 32
+    bucket_jitter: float = 16.0
     # stop the epoch loop once the approximate KL passes this (None: never)
     target_kl: float = 0.05
     normalize_returns: bool = True
+    # Scale advantages to unit std separately per workload ("workload"), over
+    # the whole batch ("batch"), or not at all. Per workload keeps a workload
+    # where reordering moves the cost a lot (memory pressure) from drowning out
+    # the signal from one where it moves it little.
+    advantage_normalization: str = "workload"
 
     def __post_init__(self):
         assert (
             self.advantage in ADVANTAGE_MODES
         ), f"advantage must be in {ADVANTAGE_MODES}"
+        assert (
+            self.advantage_normalization in ADVANTAGE_NORMALIZATIONS
+        ), f"advantage_normalization must be in {ADVANTAGE_NORMALIZATIONS}"
 
 
 class RunningStd:
@@ -156,6 +186,45 @@ def group_advantages(
     return advantages
 
 
+def minibatches(
+    lengths: np.ndarray,
+    size: int,
+    rng: np.random.Generator,
+    bucket: bool,
+    jitter: float,
+) -> List[np.ndarray]:
+    """
+    Index arrays covering every sample once, in shuffled order. With bucket,
+    each minibatch holds samples of similar length (sorted by length plus
+    uniform jitter), so padding is small.
+    """
+    if bucket:
+        order = np.argsort(
+            lengths + rng.uniform(0, jitter, len(lengths)), kind="stable"
+        )
+    else:
+        order = rng.permutation(len(lengths))
+    chunks = [order[i : i + size] for i in range(0, len(order), size)]
+    return [chunks[i] for i in rng.permutation(len(chunks))]
+
+
+def normalize_advantages(samples, relevant: np.ndarray, workloads, mode: str) -> None:
+    """In place: zero mean, unit std per workload or over the batch, with the
+    statistics taken over the relevant (admission-affecting) samples."""
+    if mode == "none":
+        return
+    keys = np.array(workloads) if mode == "workload" else np.zeros(len(samples))
+    advantages = np.array([s.advantage for s in samples])
+    for key in np.unique(keys):
+        members = keys == key
+        stats = advantages[members & relevant]
+        if len(stats) < 2:
+            continue
+        mean, std = stats.mean(), stats.std() + 1e-8
+        for i in np.flatnonzero(members):
+            samples[i].advantage = (advantages[i] - mean) / std
+
+
 # --- the update ---------------------------------------------------------------
 
 
@@ -192,13 +261,78 @@ def _request_targets(
     return waiting, running
 
 
-def _forward(model: SchedulerModel, samples: Sequence[_Sample], trajectories) -> Tuple:
+def _device_of(model: SchedulerModel) -> torch.device:
+    return next(model.parameters()).device
+
+
+def resolve_device(name: str) -> torch.device:
+    if name == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    return torch.device(name)
+
+
+class _PhaseTimer:
+    """Wall time per phase, synchronizing the device so GPU work is counted
+    in the phase that launched it."""
+
+    def __init__(self, device: torch.device) -> None:
+        self._device = device
+        self._last = time.perf_counter()
+        self.phases: Dict[str, float] = {}
+
+    def mark(self, name: str) -> None:
+        if self._device.type == "mps":
+            torch.mps.synchronize()
+        elif self._device.type == "cuda":
+            torch.cuda.synchronize()
+        now = time.perf_counter()
+        self.phases[name] = now - self._last
+        self._last = now
+
+
+def make_optimizer(
+    model: SchedulerModel, learning_rate: float
+) -> torch.optim.Optimizer:
+    """Adam with the fused kernel where supported (cuda, mps), else foreach;
+    the per-parameter fallback launches ~10 small kernels per parameter."""
+    device = _device_of(model)
+    if device.type in ("cuda", "mps"):
+        try:
+            return torch.optim.Adam(model.parameters(), lr=learning_rate, fused=True)
+        except (RuntimeError, TypeError):
+            pass
+    return torch.optim.Adam(model.parameters(), lr=learning_rate, foreach=True)
+
+
+def _padded(rows: Sequence[np.ndarray], width: int) -> torch.Tensor:
+    out = np.zeros((len(rows), width), np.float32)
+    for b, row in enumerate(rows):
+        out[b, : len(row)] = row
+    return torch.from_numpy(out)
+
+
+def _forward(
+    model: SchedulerModel,
+    samples: Sequence[_Sample],
+    trajectories,
+    pad_to_multiple: int = 1,
+) -> Tuple:
     transitions = [trajectories[s.trajectory].transitions[s.index] for s in samples]
     observations = [t.obs for t in transitions]
     modeled = [s.modeled for s in samples]
-    batch = collate(observations, model.config, modeled)
+    device = _device_of(model)
+    batch = collate(observations, model.config, modeled, pad_to_multiple).to(device)
     out = model(batch)
-    targets = interval_targets(transitions, modeled, batch.waiting.shape[1])
+    targets = {
+        k: v.to(device)
+        for k, v in interval_targets(
+            transitions, modeled, batch.waiting.shape[1]
+        ).items()
+    }
     mask = targets["loss_mask"] & batch.waiting_mask
     per_request = out.dist.interval_log_prob(targets["low"], targets["high"])
     log_prob = (per_request * mask).sum(1)
@@ -213,6 +347,7 @@ def ppo_update(
     return_std: RunningStd,
     rng: np.random.Generator,
 ) -> Dict[str, float]:
+    timer = _PhaseTimer(_device_of(model))
     # rewards, scaled by the running std of returns
     gammas = [discounts(t, config.tau_s) for t in trajectories]
     raw_returns = [
@@ -258,7 +393,8 @@ def ppo_update(
                 values = []
                 for start in range(0, len(observations), 256):
                     chunk = observations[start : start + 256]
-                    values.append(model(collate(chunk, model.config)).value.numpy())
+                    batch = collate(chunk, model.config).to(_device_of(model))
+                    values.append(model(batch).value.cpu().numpy())
                 values = np.concatenate(values) if values else np.zeros(0)
                 _, _, rewards, _, _ = per_trajectory[i]
                 advantages.append(gae(rewards, values, gammas[i], config.gae_lambda))
@@ -288,46 +424,69 @@ def ppo_update(
                 )
             )
 
-    # normalize advantages over decisions that affected admission
+    # normalize advantages, using the decisions that affected admission
     has_boundary = np.array(
         [
             trajectories[s.trajectory].transitions[s.index].boundary_index is not None
             for s in samples
         ]
     )
-    adv = np.array([s.advantage for s in samples])
-    if has_boundary.any():
-        mean, std = adv[has_boundary].mean(), adv[has_boundary].std() + 1e-8
-        for s in samples:
-            s.advantage = (s.advantage - mean) / std
+    normalize_advantages(
+        samples,
+        has_boundary,
+        [trajectories[s.trajectory].task.workload for s in samples],
+        config.advantage_normalization,
+    )
+
+    timer.mark("prepare_s")
+    lengths = np.array(
+        [len(s.modeled) + len(s.running_targets) for s in samples],
+        dtype=float,
+    )
 
     # old log-probs: the weights that collected the rollouts
     model.eval()
     with torch.no_grad():
-        for start in range(0, len(samples), 256):
-            chunk = samples[start : start + 256]
-            _, _, _, log_prob = _forward(model, chunk, trajectories)
+        for indices in minibatches(lengths, 256, rng, bucket=True, jitter=0.0):
+            chunk = [samples[j] for j in indices]
+            _, _, _, log_prob = _forward(
+                model, chunk, trajectories, config.pad_to_multiple
+            )
             for s, lp in zip(chunk, log_prob.tolist()):
                 s.old_log_prob = lp
 
+    timer.mark("old_log_prob_s")
     model.train()
     stats = defaultdict(list)
     stopped_early = False
     for epoch in range(config.epochs):
-        order = rng.permutation(len(samples))
-        epoch_kls = []
-        for start in range(0, len(order), config.minibatch_size):
-            chunk = [samples[j] for j in order[start : start + config.minibatch_size]]
-            out, batch, mask, log_prob = _forward(model, chunk, trajectories)
+        step_stats = []
+        for indices in minibatches(
+            lengths,
+            config.minibatch_size,
+            rng,
+            config.bucket_by_length,
+            config.bucket_jitter,
+        ):
+            chunk = [samples[j] for j in indices]
+            out, batch, mask, log_prob = _forward(
+                model, chunk, trajectories, config.pad_to_multiple
+            )
 
-            advantage = torch.tensor([s.advantage for s in chunk], dtype=torch.float32)
-            old = torch.tensor([s.old_log_prob for s in chunk], dtype=torch.float32)
+            device = log_prob.device
+            advantage = torch.tensor(
+                [s.advantage for s in chunk], dtype=torch.float32, device=device
+            )
+            old = torch.tensor(
+                [s.old_log_prob for s in chunk], dtype=torch.float32, device=device
+            )
             relevant = torch.tensor(
                 [
                     trajectories[s.trajectory].transitions[s.index].boundary_index
                     is not None
                     for s in chunk
-                ]
+                ],
+                device=device,
             )
             log_ratio = (log_prob - old).clamp(-20, 20)
             ratio = log_ratio.exp()
@@ -339,7 +498,7 @@ def ppo_update(
             policy_loss = -(surrogate * relevant).sum() / num_relevant
 
             value_target = torch.tensor(
-                [s.value_target for s in chunk], dtype=torch.float32
+                [s.value_target for s in chunk], dtype=torch.float32, device=device
             )
             # V = Σ v_j + v_global. The per-request values learn from their own
             # returns (below); the total return only trains v_global, on the
@@ -350,15 +509,12 @@ def ppo_update(
                 (out.global_value + request_sum.detach() - value_target) ** 2
             ).mean()
 
-            waiting_t = torch.zeros_like(out.waiting_values)
-            running_t = torch.zeros_like(out.running_values)
-            for b, s in enumerate(chunk):
-                waiting_t[b, : len(s.waiting_targets)] = torch.from_numpy(
-                    s.waiting_targets
-                )
-                running_t[b, : len(s.running_targets)] = torch.from_numpy(
-                    s.running_targets
-                )
+            waiting_t = _padded(
+                [s.waiting_targets for s in chunk], out.waiting_values.shape[1]
+            ).to(device)
+            running_t = _padded(
+                [s.running_targets for s in chunk], out.running_values.shape[1]
+            ).to(device)
             token_mask = torch.cat([batch.waiting_mask, batch.running_mask], 1).float()
             token_err = torch.cat(
                 [out.waiting_values - waiting_t, out.running_values - running_t], 1
@@ -392,22 +548,36 @@ def ppo_update(
                 clipped = (
                     ((ratio - 1).abs() > config.clip) & relevant
                 ).float().sum() / num_relevant
-            epoch_kls.append(float(approx_kl))
-            stats["policy_loss"].append(policy_loss.item())
-            stats["value_loss"].append(value_loss.item())
-            stats["request_value_loss"].append(request_value_loss.item())
-            stats["entropy"].append(entropy.item())
-            stats["approx_kl"].append(float(approx_kl))
-            stats["clip_fraction"].append(float(clipped))
-            stats["grad_norm"].append(float(grad_norm))
-            stats["value_grad_norm"].append(float(value_grad_norm))
+            # kept on the device; reading them every step would block on it
+            step_stats.append(
+                torch.stack(
+                    [
+                        policy_loss.detach(),
+                        value_loss.detach(),
+                        request_value_loss.detach(),
+                        entropy.detach(),
+                        approx_kl,
+                        clipped,
+                        grad_norm,
+                        value_grad_norm,
+                    ]
+                )
+            )
+        epoch_stats = torch.stack(step_stats).cpu().numpy()
+        for column, name in enumerate(STEP_STATS):
+            stats[name].extend(epoch_stats[:, column].tolist())
         stats["epochs"] = [epoch + 1]
-        if config.target_kl is not None and np.mean(epoch_kls) > config.target_kl:
+        if (
+            config.target_kl is not None
+            and epoch_stats[:, STEP_STATS.index("approx_kl")].mean() > config.target_kl
+        ):
             stopped_early = True
             break
 
+    timer.mark("epochs_s")
     model.eval()
     summary = {name: float(np.mean(values)) for name, values in stats.items()}
+    summary.update(timer.phases)
     summary["stopped_early"] = float(stopped_early)
     summary["return_std"] = return_std.std
     summary["num_samples"] = len(samples)

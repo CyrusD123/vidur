@@ -11,6 +11,12 @@ fraction of the FCFS-to-SJF mean gap closed, latency tails, PPO stats) to
 <output_dir>/metrics.jsonl (and wandb if enabled). Every eval_every iterations
 the deterministic policy runs on held-out eval seeds; the best checkpoint by
 eval improvement over FCFS is kept.
+
+Eval runs each decoding in eval_decodings (logged as eval/<decoding>/...; see
+TorchAgent) and picks best.pt by select_decoding, "rank" by default: the
+argmax policy hides score differences within one level, and the sampled one
+includes exploration noise. Every eval's weights are also kept in
+checkpoints/ so they can be re-scored offline.
 """
 
 import argparse
@@ -28,8 +34,15 @@ import yaml
 
 from vidur.rl.model import ModelConfig, SchedulerModel, config_for
 from vidur.rl.observation import ObservationConfig
-from vidur.rl.ppo import PPOConfig, RunningStd, ppo_update
+from vidur.rl.ppo import (
+    PPOConfig,
+    RunningStd,
+    make_optimizer,
+    ppo_update,
+    resolve_device,
+)
 from vidur.rl.reward import RewardConfig
+from vidur.rl.torch_agent import DECODINGS
 from vidur.rl.rollout import (
     RolloutCollector,
     RolloutTask,
@@ -59,6 +72,13 @@ class TrainConfig:
     # None: all cores but two; 0: in-process
     num_workers: Optional[int] = None
     eval_every: int = 10
+    eval_decodings: List[str] = field(
+        default_factory=lambda: ["rank", "argmax", "sample"]
+    )
+    # decoding whose eval picks best.pt
+    select_decoding: str = "rank"
+    # also save checkpoints/iter_<n>.pt at every eval
+    keep_eval_checkpoints: bool = True
     eval_seeds: List[int] = field(
         default_factory=lambda: list(range(TRAIN_SEED_LIMIT, TRAIN_SEED_LIMIT + 5))
     )
@@ -72,6 +92,12 @@ class TrainConfig:
         assert all(
             s >= TRAIN_SEED_LIMIT for s in self.eval_seeds
         ), f"eval seeds must be >= {TRAIN_SEED_LIMIT} (training seeds are below)"
+        assert set(self.eval_decodings) <= set(
+            DECODINGS
+        ), f"eval_decodings must be in {DECODINGS}"
+        assert (
+            self.select_decoding in self.eval_decodings
+        ), "select_decoding must be one of eval_decodings"
 
     def workload_configs(self) -> List[WorkloadConfig]:
         return [WorkloadConfig(**w) for w in self.workloads]
@@ -168,10 +194,9 @@ class Trainer:
         self.eval_workloads = config.eval_workload_configs()
         self.model_config = config.model_config()
         self.ppo_config = config.ppo_config()
-        self.model = SchedulerModel(self.model_config)
-        self.optimizer = torch.optim.Adam(
-            self.model.parameters(), lr=self.ppo_config.learning_rate
-        )
+        self.device = resolve_device(self.ppo_config.device)
+        self.model = SchedulerModel(self.model_config).to(self.device)
+        self.optimizer = make_optimizer(self.model, self.ppo_config.learning_rate)
         self.return_std = RunningStd()
         self.iteration = 0
         self.best_eval = -float("inf")
@@ -214,7 +239,8 @@ class Trainer:
 
     def eval_tasks(self) -> List[RolloutTask]:
         return [
-            RolloutTask(w.name, seed, 0, 0, deterministic=True)
+            RolloutTask(w.name, seed, 0, seed, decoding)
+            for decoding in self.config.eval_decodings
             for w in self.eval_workloads
             for seed in self.config.eval_seeds
         ]
@@ -228,6 +254,7 @@ class Trainer:
 
     def save(self, name: str) -> str:
         path = os.path.join(self.config.output_dir, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save(
             {
                 "model": self.model.state_dict(),
@@ -246,7 +273,15 @@ class Trainer:
         trajectories = self.collector.collect(
             self.model.state_dict(), self.eval_tasks()
         )
-        return trajectory_metrics(trajectories, "eval")
+        metrics = {}
+        for decoding in self.config.eval_decodings:
+            metrics.update(
+                trajectory_metrics(
+                    [t for t in trajectories if t.task.decoding == decoding],
+                    f"eval/{decoding}",
+                )
+            )
+        return metrics
 
     def train(self) -> None:
         config = self.config
@@ -275,11 +310,13 @@ class Trainer:
                 or self.iteration == config.iterations
             ):
                 metrics.update(self.evaluate())
-                score = metrics["eval/improvement_over_fcfs"]
+                score = metrics[f"eval/{config.select_decoding}/improvement_over_fcfs"]
                 if score > self.best_eval:
                     self.best_eval = score
                     self.save("best.pt")
                 self.save("latest.pt")
+                if config.keep_eval_checkpoints:
+                    self.save(f"checkpoints/iter_{self.iteration:04d}.pt")
 
             self.log(metrics)
             print(
@@ -289,11 +326,12 @@ class Trainer:
                 f"sjf_gap {metrics['train/mean_gap_closed']:+.3f} "
                 f"p99_e2e {metrics['train/p99_e2e']:6.2f} "
                 f"kl {stats['approx_kl']:.4f} ent {stats['entropy']:.3f} "
-                + (
-                    f"| eval vs_fcfs {metrics['eval/improvement_over_fcfs']:+.3f} "
-                    f"sjf_gap {metrics['eval/mean_gap_closed']:+.3f} "
-                    if "eval/improvement_over_fcfs" in metrics
-                    else ""
+                + "".join(
+                    f"| eval {d} vs_fcfs "
+                    f"{metrics[f'eval/{d}/improvement_over_fcfs']:+.3f} "
+                    f"sjf_gap {metrics[f'eval/{d}/mean_gap_closed']:+.3f} "
+                    for d in config.eval_decodings
+                    if f"eval/{d}/improvement_over_fcfs" in metrics
                 )
                 + f"({metrics['time/rollout_s']:.0f}s + {metrics['time/update_s']:.0f}s)",
                 flush=True,
@@ -326,7 +364,8 @@ def main() -> None:
 
     trainer = Trainer(load_config(args.config, args.set))
     print(
-        f"{trainer.model.num_parameters()} parameters, output in {trainer.config.output_dir}",
+        f"{trainer.model.num_parameters()} parameters on {trainer.device}, "
+        f"output in {trainer.config.output_dir}",
         flush=True,
     )
     try:

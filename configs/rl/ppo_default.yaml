@@ -34,6 +34,9 @@ model:
   shared_trunk: false
   max_queue_len: 128
   max_running_len: 128
+  # start near FCFS: 75% of each request's probability on the middle level,
+  # so sampled rankings explore small reorderings (1/16 = uniform)
+  init_middle_level_prob: 0.75
 
 ppo:
   learning_rate: 3.0e-4
@@ -43,11 +46,14 @@ ppo:
   tau_s: 25.0        # effect horizon from the fork experiment (§4)
   gae_lambda: 0.95
   advantage: group   # time-aligned leave-one-out over group_size rollouts
+  advantage_normalization: workload   # unit std per workload, not per batch
   value_coef: 0.5
   request_value_coef: 0.5
   entropy_coef: 0.003
   max_grad_norm: 0.5
   target_kl: 0.05
+  device: auto           # learner: cuda, then mps, then cpu
+  bucket_by_length: true # minibatches of similar-size states (less padding)
 
 iterations: 200
 seeds_per_iteration: 8
@@ -55,4 +61,8 @@ group_size: 4
 num_workers: null   # all cores but two
 eval_every: 10
 eval_seeds: [1000000, 1000001, 1000002, 1000003, 1000004]
+# logged as eval/<decoding>/...; best.pt is picked by select_decoding
+eval_decodings: [rank, argmax, sample]
+select_decoding: rank
+keep_eval_checkpoints: true
 wandb: false

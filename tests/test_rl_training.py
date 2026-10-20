@@ -6,6 +6,7 @@ Run from the repo root (so ./data and ./cache resolve):
     python -m pytest tests/test_rl_training.py -v
 """
 
+import json
 import pickle
 
 import numpy as np
@@ -26,6 +27,7 @@ from vidur.rl.model import (
     ModelConfig,
     ObsBatch,
     SchedulerModel,
+    collate,
     config_for,
     full_actions,
     modeled_indices,
@@ -33,9 +35,12 @@ from vidur.rl.model import (
 from vidur.rl.ppo import (
     PPOConfig,
     RunningStd,
+    _Sample,
     discounted_returns,
     gae,
     group_advantages,
+    minibatches,
+    normalize_advantages,
     ppo_update,
     return_at,
 )
@@ -187,16 +192,43 @@ def collector(tmp_path_factory):
     )
 
 
-def test_initial_deterministic_policy_is_fcfs(collector):
+@pytest.mark.parametrize("decoding", ["argmax", "rank"])
+def test_initial_deterministic_policy_is_fcfs(collector, decoding):
     model = SchedulerModel(collector._runner.model.config)
     [trajectory] = collector.collect(
-        model.state_dict(), [RolloutTask("tiny", 0, 0, 0, deterministic=True)]
+        model.state_dict(), [RolloutTask("tiny", 0, 0, 0, decoding)]
     )
     assert trajectory.improvement_over_fcfs == 0
     fcfs = collector.env("tiny").reference_episode("fcfs", 0)
     # identical schedule (total_reward differs: references use a plain reward)
     latency = {k: v for k, v in trajectory.summary.items() if k != "total_reward"}
     assert latency == {k: v for k, v in fcfs.summary.items() if k != "total_reward"}
+
+
+def test_rank_decoding_follows_expected_level(collector):
+    env = collector.env("tiny")
+    model = SchedulerModel(collector._runner.model.config)
+    _randomize(model)
+    episode = env.run_episode(TorchAgent(model, decoding="rank"), workload_seed=0)
+    num_levels = model.config.num_priority_levels
+    checked = 0
+    for t in episode.transitions:
+        modeled = modeled_indices(t.obs, model.config.max_queue_len)
+        if len(modeled) < 2:
+            continue
+        with torch.no_grad():
+            out = model(collate([t.obs], model.config, [modeled]), with_value=False)
+        probs = out.dist.level_log_probs()[0, : len(modeled)].exp()
+        expected = (probs * torch.arange(num_levels)).sum(-1).numpy()
+        levels = t.action[modeled]
+        # higher expected level never gets a lower priority level
+        order = np.argsort(expected, kind="stable")
+        assert (np.diff(levels[order]) >= 0).all()
+        # the ranking is cut into equal groups spanning the levels
+        assert levels.min() == 0
+        assert levels.max() == (len(modeled) - 1) * num_levels // len(modeled)
+        checked += 1
+    assert checked > 0
 
 
 def test_agent_is_reproducible_with_seed(collector):
@@ -270,7 +302,62 @@ def test_train_and_evaluate_smoke(tmp_path):
     lines = (tmp_path / "metrics.jsonl").read_text().splitlines()
     assert len(lines) == 2
     assert (tmp_path / "best.pt").exists() and (tmp_path / "latest.pt").exists()
+    assert (tmp_path / "checkpoints" / "iter_0002.pt").exists()
+    last = json.loads(lines[-1])
+    for decoding in ("rank", "argmax", "sample"):
+        assert np.isfinite(last[f"eval/{decoding}/improvement_over_fcfs"])
 
     table = evaluate(str(tmp_path / "best.pt"), baselines=("fcfs",))
-    assert set(table["policy"]) == {"policy", "fcfs"}
+    assert set(table["policy"]) == {"policy_rank", "policy_argmax", "fcfs"}
     assert np.isfinite(table["improvement_over_fcfs"]).all()
+
+
+@pytest.mark.parametrize("head", HEADS)
+@pytest.mark.parametrize("p", [0.75, 0.9])
+def test_initial_concentration(head, p):
+    config = ModelConfig(
+        5, 4, 3, num_priority_levels=16, head=head, init_middle_level_prob=p
+    )
+    model = SchedulerModel(config)
+    with torch.no_grad():
+        out = model(
+            _random_batch(config, torch.Generator().manual_seed(0)), with_value=False
+        )
+    probs = out.dist.level_log_probs().exp()
+    assert torch.allclose(probs[..., 7], torch.full_like(probs[..., 7], p), atol=1e-5)
+    assert (out.dist.mode() == 7).all()
+
+
+def test_advantages_normalized_per_workload():
+    rng = np.random.default_rng(0)
+    samples = [
+        _Sample(0, i, np.zeros(0), 0.0, 0.0, np.zeros(0), np.zeros(0))
+        for i in range(200)
+    ]
+    workloads = ["big"] * 100 + ["small"] * 100
+    for i, s in enumerate(samples):
+        s.advantage = rng.normal(5, 10) if i < 100 else rng.normal(0, 0.1)
+    normalize_advantages(samples, np.ones(200, bool), workloads, "workload")
+    advantages = np.array([s.advantage for s in samples])
+    for part in (advantages[:100], advantages[100:]):
+        assert np.isclose(part.mean(), 0, atol=1e-6) and np.isclose(
+            part.std(), 1, atol=1e-3
+        )
+
+
+def test_bucketed_minibatches_cover_everything_with_less_padding():
+    rng = np.random.default_rng(0)
+    lengths = rng.integers(2, 257, 1000).astype(float)
+    for bucket in (False, True):
+        batches = minibatches(lengths, 64, rng, bucket, jitter=16.0)
+        assert sorted(np.concatenate(batches).tolist()) == list(range(1000))
+    padding = {
+        bucket: np.mean(
+            [
+                lengths[b].max() - lengths[b].mean()
+                for b in minibatches(lengths, 64, rng, bucket, 16.0)
+            ]
+        )
+        for bucket in (False, True)
+    }
+    assert padding[True] < 0.2 * padding[False]

@@ -8,13 +8,22 @@ from vidur.rl.agents import BaseAgent
 from vidur.rl.model import SchedulerModel, collate, full_actions, modeled_indices
 from vidur.rl.observation import Observation
 
+DECODINGS = ("sample", "argmax", "rank")
+
 
 class TorchAgent(BaseAgent):
     """
     Samples priorities from a SchedulerModel, one observation at a time.
 
-    Sampling uses a private torch.Generator (Vidur reseeds the global RNGs per
-    workload). deterministic=True takes each request's most likely level.
+    decoding (docs/rl_plan.md §6 step 5):
+    - "sample": each request's level is drawn independently from its
+      distribution, with a private torch.Generator (Vidur reseeds the global
+      RNGs per workload). Training rollouts use this.
+    - "argmax": each request's most likely level. Coarse: scores that move
+      within one level's interval change nothing.
+    - "rank": sort requests by expected level E[a] (for the ordinal head, the
+      same order as the scores; ties by arrival), then cut the ranking into L
+      equal groups. Uses every score difference; the default for evaluation.
 
     Nothing about the action distribution is stored: PPO recomputes the
     rollout log-probabilities from the same weights before its first update,
@@ -28,10 +37,11 @@ class TorchAgent(BaseAgent):
         self,
         model: SchedulerModel,
         seed: Optional[int] = None,
-        deterministic: bool = False,
+        decoding: str = "sample",
     ) -> None:
+        assert decoding in DECODINGS, f"decoding must be one of {DECODINGS}"
         self._model = model
-        self._deterministic = deterministic
+        self._decoding = decoding
         self._generator = torch.Generator()
         if seed is not None:
             self._generator.manual_seed(seed)
@@ -49,13 +59,32 @@ class TorchAgent(BaseAgent):
         modeled = modeled_indices(obs, self._model.config.max_queue_len)
         batch = collate([obs], self._model.config, [modeled])
         out = self._model(batch, with_value=False)
-        levels = (
-            out.dist.mode() if self._deterministic else out.dist.sample(self._generator)
-        )
-        action = full_actions(obs, modeled, levels[0].numpy())
+        if self._decoding == "sample":
+            levels = out.dist.sample(self._generator)[0].numpy()
+        elif self._decoding == "argmax":
+            levels = out.dist.mode()[0].numpy()
+        else:
+            levels = self._rank_levels(obs, modeled, out.dist)
+        action = full_actions(obs, modeled, levels)
         elapsed = time.perf_counter() - start
         self.decision_times.append(elapsed)
         return action, {"decision_time_s": elapsed}
+
+    @staticmethod
+    def _rank_levels(obs: Observation, modeled: np.ndarray, dist) -> np.ndarray:
+        num_levels = dist.num_levels
+        probs = dist.level_log_probs()[0, : len(modeled)].exp()
+        expected = (probs * torch.arange(num_levels, dtype=probs.dtype)).sum(-1)
+        order = np.lexsort(
+            (
+                np.asarray(obs.request_ids)[modeled],
+                np.asarray(obs.arrival_times)[modeled],
+                expected.numpy(),
+            )
+        )
+        ranks = np.empty(len(order), dtype=np.int64)
+        ranks[order] = np.arange(len(order))
+        return ranks * num_levels // max(1, len(order))
 
 
 def mean_decision_time(agent: TorchAgent) -> float:
