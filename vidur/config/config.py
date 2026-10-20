@@ -311,12 +311,46 @@ class RlVllmSchedulerConfig(VllmSchedulerConfig):
         },
     )
     num_priority_levels: int = field(
-        default=8,
+        default=16,
         metadata={
             "help": "Number of priority levels. Priorities are integers in "
             "[0, num_priority_levels), lower is scheduled first."
         },
     )
+    tie_break: str = field(
+        default="arrival",
+        metadata={
+            "help": "How requests with equal priority are ordered: 'arrival' "
+            "(earliest arrival first, as in vLLM's priority policy) or "
+            "'previous_order' (keep their order from the previous ranking)."
+        },
+    )
+    decision_mode: str = field(
+        default="every_batch",
+        metadata={
+            "help": "When the priority policy is consulted: 'every_batch' re-ranks "
+            "the whole waiting queue before every batch; 'arrival_and_periodic' "
+            "ranks new requests once and re-ranks everything every "
+            "rerank_interval_s, with priorities persisting in between."
+        },
+    )
+    rerank_interval_s: float = field(
+        default=0.1,
+        metadata={
+            "help": "Seconds between full re-rankings in arrival_and_periodic mode."
+        },
+    )
+
+    def __post_init__(self):
+        assert self.tie_break in (
+            "arrival",
+            "previous_order",
+        ), f"Unknown tie_break {self.tie_break}"
+        assert self.decision_mode in (
+            "every_batch",
+            "arrival_and_periodic",
+        ), f"Unknown decision_mode {self.decision_mode}"
+        assert self.rerank_interval_s > 0
 
     @staticmethod
     def get_type():

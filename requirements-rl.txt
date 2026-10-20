@@ -1,0 +1,4 @@
+# RL training (vidur/rl); install on top of requirements.txt
+torch>=2.9
+pyyaml
+pytest

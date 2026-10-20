@@ -1,5 +1,4 @@
 from bisect import insort
-from itertools import count
 from math import ceil
 from typing import Dict, List
 
@@ -22,7 +21,9 @@ class VLLMReplicaScheduler(BaseReplicaScheduler):
         # running requests in admission order; requests that are part of an
         # in-flight batch are temporarily absent from this list
         self._running: List[Request] = []
-        self._admission_counter = count()
+        # a plain int rather than itertools.count so the scheduler can be
+        # deep-copied (the RL environment forks simulations)
+        self._admission_counter = 0
         self._admission_order: Dict[int, int] = {}
         self._num_running_batches = 0
         self._watermark_blocks = int(
@@ -143,7 +144,8 @@ class VLLMReplicaScheduler(BaseReplicaScheduler):
             self.allocate(
                 request.id, self._num_required_blocks(request, next_num_tokens)
             )
-            self._admission_order[request.id] = next(self._admission_counter)
+            self._admission_order[request.id] = self._admission_counter
+            self._admission_counter += 1
             requests.append(request)
             num_tokens.append(next_num_tokens)
             token_budget -= next_num_tokens

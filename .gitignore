@@ -185,3 +185,6 @@ env_3
 *.swo
 *~
 *.tmp
+
+# RL training runs (vidur/rl/train.py)
+rl_runs/

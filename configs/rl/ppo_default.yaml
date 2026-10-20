@@ -1,0 +1,58 @@
+# PPO for the queue-ranking scheduler (docs/rl_plan.md). Every section maps onto
+# a dataclass: observation -> ObservationConfig, reward -> RewardConfig,
+# model -> ModelConfig, ppo -> PPOConfig, workloads -> WorkloadConfig.
+output_dir: rl_runs/ppo_default
+seed: 0
+
+# Workloads are sampled by weight. Ordering matters most under KV-memory
+# pressure (qps 10 / 4000 blocks); qps 20 with the default cache is overloaded
+# but has less to gain. Extra make_simulation_config kwargs go under
+# `simulation` (e.g. trace_file).
+workloads:
+  - {name: qps10_blocks4000, qps: 10, num_blocks: 4000, num_requests: 300, weight: 1.0}
+  - {name: qps20, qps: 20, num_requests: 300, weight: 1.0}
+
+num_priority_levels: 16
+
+observation: {}  # default features (vidur/rl/observation.py)
+
+# Recommended start from the reward weight check (docs/rl_plan.md §2):
+# mean normalized latency + e2e tail hinge against FCFS's local p95
+reward:
+  weights: {e2e_normalized: 1.0, e2e_hinge: 0.3}
+  threshold_mode: reference_window
+  calibration_quantile: 0.95
+  reference_window_requests: 50
+  normalize_by_baselines: [fcfs]
+
+model:
+  encoder: transformer
+  head: ordinal
+  d_model: 64
+  num_layers: 2
+  num_heads: 4
+  shared_trunk: false
+  max_queue_len: 128
+  max_running_len: 128
+
+ppo:
+  learning_rate: 3.0e-4
+  clip: 0.2
+  epochs: 4
+  minibatch_size: 128
+  tau_s: 25.0        # effect horizon from the fork experiment (§4)
+  gae_lambda: 0.95
+  advantage: group   # time-aligned leave-one-out over group_size rollouts
+  value_coef: 0.5
+  request_value_coef: 0.5
+  entropy_coef: 0.003
+  max_grad_norm: 0.5
+  target_kl: 0.05
+
+iterations: 200
+seeds_per_iteration: 8
+group_size: 4
+num_workers: null   # all cores but two
+eval_every: 10
+eval_seeds: [1000000, 1000001, 1000002, 1000003, 1000004]
+wandb: false

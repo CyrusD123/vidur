@@ -184,7 +184,7 @@ def test_rankings_that_admit_nothing_are_undone(env):
                 0, scheduler.num_priority_levels, len(waiting_requests)
             ).tolist()
 
-        def on_batch_formed(self, admitted_requests):
+        def on_batch_formed(self, admitted_requests, boundary_request):
             if admitted_requests:
                 return
             ids_after = [r.id for r in self.scheduler.waiting_requests]
