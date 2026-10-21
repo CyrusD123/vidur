@@ -861,3 +861,89 @@ sample`, 5 eval seeds; improvement over FCFS / mean gap closed):
 6. Per-component reward normalization (§2, not implemented): one policy with a
    consistent mean/tail trade-off across loads, vs. absolute-unit weights tuned
    for the deployment load. Decide after the first multi-load PPO runs.
+
+## 8. Imitation learning from oracle SJF, then PPO fine-tuning (branch `imitation`)
+
+Instead of PPO from a near-FCFS start, first imitate an oracle teacher, then
+fine-tune with PPO. The teacher is SJF on `total_tokens` with 800 tok/s aging
+(`sjf_total_tokens_age800`). It reads true output lengths. The student sees the
+usual observation, which never contains them, so it has to infer the teacher's
+ranking from what a server knows: prompt length, wait time, history.
+
+### Implementation
+
+- `vidur/rl/teacher.py`
+  - `ImitationAgent`, an `OracleAgent`: at every decision it stores the
+    teacher's exact rank and 16-level bucketed level in `Transition.info`, and
+    acts with the teacher with probability β, else with the student (DAgger's
+    mixture policy). With β = 0 it only labels the student's own rollouts.
+  - `imitation_losses`:
+    - level term: −log P(a_i = teacher level), which trains scores and cutpoints,
+      so the sampled policy (what PPO explores with) follows the teacher
+    - rank term: pairwise softplus(s_i − s_j) for every pair the teacher orders
+      i before j, which trains the order `rank` decoding deploys, within levels too
+  - `agreement_metrics`, on decisions with a boundary:
+    - pair agreement with the teacher's order
+    - overlap of the admitted set with the teacher's first k
+    - head agreement
+- `vidur/rl/imitation.py` (`python -m vidur.rl.imitation --config
+  configs/rl/imitation_sjf_age800.yaml`): DAgger. 64 teacher rollouts, then 10
+  iterations of: fit 2 epochs on all labeled decisions so far, eval, then collect
+  32 mixture rollouts (β = 0.5, 0.25, …, student acting with `rank` decoding).
+  Only decisions with an admission boundary are trained on. Checkpoints use the
+  `train.py` format.
+- Fine-tuning: `TrainConfig.init_checkpoint` starts PPO from the imitation
+  weights. `ppo.imitation_coef` (0.1 in the config) adds the imitation loss on
+  teacher-labeled PPO rollouts as an anchor. With `imitation.teacher` set, eval
+  rollouts are labeled too, and agreement is logged as `eval/<decoding>/pair_agreement` etc.
+- New job-size key `prefill_tokens` (prompt only, no oracle). Its baseline,
+  `sjf_prefill_tokens_age800_16lvl`, is the obvious non-oracle approximation of
+  the teacher. In splitwise_conv, prompt and output length are nearly
+  uncorrelated (Spearman 0.07), but the prompt is ~85% of total tokens, so it
+  carries most of the teacher's ranking.
+- `model.init_middle_level_prob: 0.25` for imitation: with 0.75, far levels have
+  almost no probability, and the initial level NLL is ~13.
+- Tests: `tests/test_rl_imitation.py`.
+
+### Results (`rl_runs/imitation_sjf_age800`, `..._ppo`)
+
+The teacher is weak under the training reward. On seeds 0–4,
+`sjf_total_tokens_age800` scores +0.003 vs FCFS at qps10_blocks4000 and +0.050
+at qps20, against +0.086 / +0.080 for the 400 tok/s variant (§2).
+
+DAgger (about 9 min, 56K labeled decisions): train pair accuracy 0.97. Eval
+pair agreement with the teacher rose from 0.81 to 0.96 (`rank`) over the 10
+iterations.
+
+Held-out seeds 1000005–1000019 (15 seeds, not used for any selection). Paired
+per-seed differences in improvement over FCFS, mean ± s.e.:
+
+| | qps10_blocks4000 | qps20 |
+|---|---|---|
+| imitation `rank`, vs FCFS | +0.030 ± 0.034 | +0.034 ± 0.003 (15/15 wins) |
+| imitation − teacher (16 lvl) | +0.058 ± 0.044 | +0.001 ± 0.002 |
+| imitation − prompt-only SJF (16 lvl) | +0.084 ± 0.048 | +0.006 ± 0.002 |
+| fine-tuned (100 PPO iters) `rank` − imitation `rank` | −0.115 ± 0.068 | +0.009 ± 0.002 (13/15) |
+| fine-tuned `sample`, vs FCFS | +0.046 | +0.039 |
+| aging SJF 400 (oracle), vs FCFS | +0.031 | +0.081 |
+
+Readings:
+- **Imitation transfers without output lengths.** At qps20 the student matches
+  its oracle teacher and beats the prompt-only heuristic. So it uses more than
+  prompt length (e.g. history and load features). At qps10_blocks4000 it scores
+  above the teacher, but the per-seed spread there is ~0.15, so this is not
+  significant.
+- **Fine-tuning helps at qps20**: it now beats the teacher by +0.010 ± 0.003,
+  with lower mean e2e (−0.14 s) and unchanged p99. At qps10_blocks4000, `rank`
+  decoding got worse while `sample` improved (−0.078 → +0.046). PPO optimizes
+  the sampled policy, and at this load the deterministic decoding didn't follow.
+  This is the same workload that regressed in run 2.
+- The approximate KL passed `target_kl` (0.05) in the first epoch for most of
+  the first ~10 iterations, so those updates ran one epoch only.
+- Next:
+  - imitate `sjf_total_tokens_age400`, which is the stronger teacher under this
+    reward (`--set imitation.teacher=sjf_total_tokens_age400`)
+  - select fine-tuning checkpoints by `sample` at qps10_blocks4000, or add a
+    rank-consistency term
+  - diagnostic: an oracle output-length feature for the student only, to
+    separate missing information from imitation error

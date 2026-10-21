@@ -24,6 +24,7 @@ from vidur.rl.reward import (
     episode_cost,
     per_request_rewards,
 )
+from vidur.rl.teacher import ImitationAgent, make_teacher
 from vidur.rl.torch_agent import TorchAgent, mean_decision_time
 
 
@@ -65,6 +66,10 @@ class RolloutTask:
     agent_seed: int
     # TorchAgent decoding: "sample" (training), "argmax" or "rank"
     decoding: str = "sample"
+    # oracle teacher (vidur/rl/teacher.py): record its ranking at every
+    # decision, and act with it with probability teacher_mix (DAgger)
+    teacher: Optional[str] = None
+    teacher_mix: float = 0.0
 
 
 @dataclass
@@ -122,7 +127,12 @@ class RolloutRunner:
 
     def run(self, task: RolloutTask) -> Trajectory:
         env = self.env(task.workload)
-        agent = TorchAgent(self.model, task.agent_seed, task.decoding)
+        student = TorchAgent(self.model, task.agent_seed, task.decoding)
+        agent = student
+        if task.teacher is not None:
+            agent = ImitationAgent(
+                make_teacher(task.teacher), student, task.teacher_mix, task.agent_seed
+            )
         episode = env.run_episode(agent, workload_seed=task.workload_seed)
 
         fcfs = env.reference_episode("fcfs", task.workload_seed)
@@ -135,7 +145,7 @@ class RolloutRunner:
             fcfs_cost=episode_cost(fcfs, env.reward_config, episode.request_thresholds),
             mean_gap_closed=env.mean_gap_closed(episode, task.workload_seed),
             summary=episode.summary,
-            decision_time_s=mean_decision_time(agent),
+            decision_time_s=mean_decision_time(student),
         )
 
     def run_all(

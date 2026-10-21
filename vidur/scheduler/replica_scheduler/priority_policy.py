@@ -68,18 +68,20 @@ class FCFSPriorityPolicy(BasePriorityPolicy):
         return [0] * len(waiting_requests)
 
 
-JOB_SIZE_KEYS = ("total_tokens", "decode_tokens", "iterations")
+# prefill_tokens is the only key that does not read the output length
+JOB_SIZE_KEYS = ("total_tokens", "decode_tokens", "iterations", "prefill_tokens")
 
 
 def job_size(request: Request, key: str, max_num_batched_tokens: int) -> int:
     """
     Remaining work of a waiting request, using its true output length (an
-    oracle; the RL observation never exposes it).
+    oracle; the RL observation never exposes it), except for prefill_tokens.
 
       total_tokens   prefill + decode tokens
       decode_tokens  output tokens still to generate
       iterations     scheduler iterations it needs on its own: chunked prefill
                      iterations plus one per output token
+      prefill_tokens prompt tokens only: not an oracle, a server knows it
 
     A preempted request restarts with its generated tokens folded into the
     prompt, so these stay the remaining work after a restart.
@@ -91,6 +93,8 @@ def job_size(request: Request, key: str, max_num_batched_tokens: int) -> int:
     if key == "iterations":
         prefill_iterations = -(-request.num_prefill_tokens // max_num_batched_tokens)
         return prefill_iterations + request.num_decode_tokens
+    if key == "prefill_tokens":
+        return request.num_prefill_tokens
     raise ValueError(f"Unknown job size key {key}. Valid keys: {JOB_SIZE_KEYS}")
 
 

@@ -16,6 +16,9 @@ PPO for the queue-ranking scheduler (docs/rl_plan.md §3, §4, §6 step 6).
   the encoder supervision and V; they are never used for the policy.
 - Returns are divided by a running std, so reward scale changes (QPS, reward
   weights) do not need retuning.
+- Optional imitation anchor (imitation_coef > 0, for fine-tuning an imitation
+  policy): the teacher's imitation loss (vidur/rl/teacher.py) on the rollouts'
+  labeled decisions is added to the policy loss.
 """
 
 import math
@@ -29,6 +32,7 @@ import torch
 
 from vidur.rl.model import SchedulerModel, collate, interval_targets, modeled_indices
 from vidur.rl.rollout import Trajectory
+from vidur.rl.teacher import imitation_losses, imitation_targets
 
 ADVANTAGE_MODES = ("group", "gae")
 ADVANTAGE_NORMALIZATIONS = ("workload", "batch", "none")
@@ -41,6 +45,7 @@ STEP_STATS = (
     "clip_fraction",
     "grad_norm",
     "value_grad_norm",
+    "imitation_loss",
 )
 
 
@@ -76,6 +81,9 @@ class PPOConfig:
     # where reordering moves the cost a lot (memory pressure) from drowning out
     # the signal from one where it moves it little.
     advantage_normalization: str = "workload"
+    # weight of the imitation loss (level + rank terms) on decisions labeled by
+    # a teacher; the rollouts must carry labels (RolloutTask.teacher)
+    imitation_coef: float = 0.0
 
     def __post_init__(self):
         assert (
@@ -525,11 +533,31 @@ def ppo_update(
 
             entropy = (out.dist.entropy() * mask).sum() / mask.sum().clamp(min=1)
 
+            imitation_loss = torch.zeros((), device=device)
+            if config.imitation_coef > 0:
+                transitions = [
+                    trajectories[s.trajectory].transitions[s.index] for s in chunk
+                ]
+                targets = {
+                    k: v.to(device)
+                    for k, v in imitation_targets(
+                        transitions,
+                        [s.modeled for s in chunk],
+                        batch.waiting.shape[1],
+                    ).items()
+                }
+                losses = imitation_losses(out.dist, targets, mask)
+                weight = (targets["labeled"] & relevant).float()
+                imitation_loss = (
+                    (losses["level_loss"] + losses["rank_loss"]) * weight
+                ).sum() / weight.sum().clamp(min=1)
+
             loss = (
                 policy_loss
                 + config.value_coef * value_loss
                 + config.request_value_coef * request_value_loss
                 - config.entropy_coef * entropy
+                + config.imitation_coef * imitation_loss
             )
             optimizer.zero_grad()
             loss.backward()
@@ -560,6 +588,7 @@ def ppo_update(
                         clipped,
                         grad_norm,
                         value_grad_norm,
+                        imitation_loss.detach(),
                     ]
                 )
             )

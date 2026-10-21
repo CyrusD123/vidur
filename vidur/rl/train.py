@@ -12,6 +12,11 @@ fraction of the FCFS-to-SJF mean gap closed, latency tails, PPO stats) to
 the deterministic policy runs on held-out eval seeds; the best checkpoint by
 eval improvement over FCFS is kept.
 
+Fine-tuning an imitation policy (vidur/rl/imitation.py): set init_checkpoint
+to its checkpoint. With imitation.teacher set, eval rollouts also record the
+teacher's ranking and log agreement with it; with ppo.imitation_coef > 0 the
+training rollouts do too, and PPO adds the imitation loss as an anchor.
+
 Eval runs each decoding in eval_decodings (logged as eval/<decoding>/...; see
 TorchAgent) and picks best.pt by select_decoding, "rank" by default: the
 argmax policy hides score differences within one level, and the sampled one
@@ -42,6 +47,7 @@ from vidur.rl.ppo import (
     resolve_device,
 )
 from vidur.rl.reward import RewardConfig
+from vidur.rl.teacher import agreement_metrics
 from vidur.rl.torch_agent import DECODINGS
 from vidur.rl.rollout import (
     RolloutCollector,
@@ -64,6 +70,11 @@ class TrainConfig:
     reward: Dict[str, Any] = field(default_factory=dict)
     model: Dict[str, Any] = field(default_factory=dict)
     ppo: Dict[str, Any] = field(default_factory=dict)
+    # ImitationConfig (vidur/rl/imitation.py); its teacher also labels PPO
+    # rollouts (see the module docstring)
+    imitation: Dict[str, Any] = field(default_factory=dict)
+    # start PPO from these model weights (e.g. an imitation checkpoint)
+    init_checkpoint: Optional[str] = None
     num_priority_levels: int = 16
 
     iterations: int = 200
@@ -98,6 +109,9 @@ class TrainConfig:
         assert (
             self.select_decoding in self.eval_decodings
         ), "select_decoding must be one of eval_decodings"
+        assert (
+            not self.ppo.get("imitation_coef") or self.teacher
+        ), "ppo.imitation_coef needs imitation.teacher"
 
     def workload_configs(self) -> List[WorkloadConfig]:
         return [WorkloadConfig(**w) for w in self.workloads]
@@ -122,6 +136,10 @@ class TrainConfig:
 
     def ppo_config(self) -> PPOConfig:
         return PPOConfig(**self.ppo)
+
+    @property
+    def teacher(self) -> Optional[str]:
+        return self.imitation.get("teacher")
 
 
 def _set_dotted(config: Dict[str, Any], key: str, value: str) -> None:
@@ -158,7 +176,9 @@ def trajectory_metrics(
             values = [v for v in values if np.isfinite(v)]
             return float(np.mean(values)) if values else float("nan")
 
+        agreement = agreement_metrics([x for t in group for x in t.transitions])
         return {
+            **{k: v for k, v in agreement.items() if np.isfinite(v)},
             "return": mean([t.total_reward for t in group]),
             "improvement_over_fcfs": mean([t.improvement_over_fcfs for t in group]),
             "mean_gap_closed": mean([t.mean_gap_closed for t in group]),
@@ -195,7 +215,16 @@ class Trainer:
         self.model_config = config.model_config()
         self.ppo_config = config.ppo_config()
         self.device = resolve_device(self.ppo_config.device)
-        self.model = SchedulerModel(self.model_config).to(self.device)
+        self.model = SchedulerModel(self.model_config)
+        if config.init_checkpoint:
+            checkpoint = torch.load(
+                config.init_checkpoint, map_location="cpu", weights_only=False
+            )
+            assert (
+                ModelConfig(**checkpoint["model_config"]) == self.model_config
+            ), "init_checkpoint has a different model config"
+            self.model.load_state_dict(checkpoint["model"])
+        self.model = self.model.to(self.device)
         self.optimizer = make_optimizer(self.model, self.ppo_config.learning_rate)
         self.return_std = RunningStd()
         self.iteration = 0
@@ -234,12 +263,24 @@ class Trainer:
             seed = int(self.rng.integers(0, TRAIN_SEED_LIMIT))
             for k in range(self.config.group_size):
                 agent_seed = int(self.rng.integers(0, 2**31))
-                tasks.append(RolloutTask(workload.name, seed, k, agent_seed))
+                tasks.append(
+                    RolloutTask(
+                        workload.name,
+                        seed,
+                        k,
+                        agent_seed,
+                        teacher=(
+                            self.config.teacher
+                            if self.ppo_config.imitation_coef > 0
+                            else None
+                        ),
+                    )
+                )
         return tasks
 
     def eval_tasks(self) -> List[RolloutTask]:
         return [
-            RolloutTask(w.name, seed, 0, seed, decoding)
+            RolloutTask(w.name, seed, 0, seed, decoding, teacher=self.config.teacher)
             for decoding in self.config.eval_decodings
             for w in self.eval_workloads
             for seed in self.config.eval_seeds

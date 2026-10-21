@@ -78,6 +78,8 @@ class OracleSJFAgent(OracleAgent):
     num_levels=None sorts the queue exactly (priority = rank). With
     num_levels=L the sorted queue is cut into L equal-size groups, which is a
     ranking the RL agent could itself express with L priority levels.
+
+    key="prefill_tokens" ranks by prompt length only, which needs no oracle.
     """
 
     def __init__(
@@ -93,12 +95,14 @@ class OracleSJFAgent(OracleAgent):
         self._aging = aging
         self.unbounded_priorities = num_levels is None
 
-    def act_oracle(
+    def ranks(
         self,
         obs: Observation,
         waiting_requests: List[Request],
         scheduler: "RLVLLMReplicaScheduler",
-    ) -> Tuple[Sequence[int], Dict[str, Any]]:
+    ) -> np.ndarray:
+        """[num_requests] position of each request (obs order) in the exact
+        SJF order, 0 = first."""
         sizes = np.array(
             [
                 job_size(r, self._key, scheduler.max_num_batched_tokens)
@@ -112,11 +116,23 @@ class OracleSJFAgent(OracleAgent):
         order = np.lexsort((obs.request_ids, obs.arrival_times, sizes))
         ranks = np.empty(len(order), dtype=np.int64)
         ranks[order] = np.arange(len(order))
+        return ranks
+
+    def act_oracle(
+        self,
+        obs: Observation,
+        waiting_requests: List[Request],
+        scheduler: "RLVLLMReplicaScheduler",
+    ) -> Tuple[Sequence[int], Dict[str, Any]]:
+        ranks = self.ranks(obs, waiting_requests, scheduler)
         if self._num_levels is None:
             return ranks, {}
+        return bucket_ranks(ranks, min(self._num_levels, obs.num_priority_levels)), {}
 
-        num_levels = min(self._num_levels, obs.num_priority_levels)
-        return ranks * num_levels // len(order), {}
+
+def bucket_ranks(ranks: np.ndarray, num_levels: int) -> np.ndarray:
+    """Cut a ranking (0 = first) into num_levels equal-size groups."""
+    return ranks * num_levels // max(1, len(ranks))
 
 
 _SJF_NAME = re.compile(
