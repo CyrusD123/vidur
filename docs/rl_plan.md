@@ -844,6 +844,96 @@ sample`, 5 eval seeds; improvement over FCFS / mean gap closed):
   qps10_blocks4000-only run to separate interference between workloads from
   the difficulty of that workload.
 
+### Trace workloads
+
+`WorkloadConfig` (and `make_simulation_config`) now take `trace` (a name in
+`vidur/rl/env.py:TRACE_FILES` or a path) and `arrivals`:
+
+| `trace` | file | source |
+|---|---|---|
+| `azure_conv` (default) | `splitwise_conv.csv` | Azure LLM inference trace 2023, conversation |
+| `azure_code` | `splitwise_code.csv` | same, code |
+| `sharegpt` | `sharegpt_llama3_tokenizer.csv` | ShareGPT V3, first turns |
+| `lmsys` | `lmsys_llama3_tokenizer.csv` | LMSYS-Chat-1M, first turns (not built yet: gated) |
+| `arxiv` | `arxiv_summarization_…csv` | arXiv summarization |
+
+- `arrivals: poisson` (default): Poisson arrivals at `qps`, request lengths
+  shuffled by the workload seed. This is how the learning-to-rank paper
+  (Fu et al., arXiv 2408.15792) uses ShareGPT and LMSYS-Chat-1M.
+- `arrivals: trace` (`TraceWindowRequestGenerator`): replays `num_requests`
+  consecutive requests of a trace with arrival times (the Azure traces). The
+  workload seed picks where the window starts. `qps` rescales time by one
+  global factor so the whole trace averages `qps` (`null` = native, 5.5 qps
+  for conv), so windows keep their own burstiness and load.
+- `azure_conv` with Poisson arrivals is what the existing workloads always
+  used. `splitwise_conv.csv` is row-for-row the Azure
+  `AzureLLMInferenceTrace_conv.csv` (checked by `prepare_traces.py azure`).
+- ShareGPT and LMSYS are built by `vidur/rl/prepare_traces.py`: first user
+  turn and its reply, Llama-3 tokenizer, plus 10 chat-template tokens on the
+  prompt (the paper counts the template too), pairs over 4096 tokens dropped.
+  ShareGPT: 58,593 pairs, prompt mean 230 (paper: 240), output mean 269.
+- Difference from the paper: it regenerates outputs with Llama-3 at
+  temperature 1.0; we use the recorded replies. ShareGPT's recorded outputs
+  have low length variability (CV 0.73), which limits what SJF can gain.
+
+### Choosing loads
+
+With the default KV cache (A100-80GB: 30,208 blocks) the 256-request batch cap
+binds first, and ShareGPT saturates at ~16-17 req/s. Below that, or in
+300-request episodes (the first 256 requests are admitted at once), every
+policy is within 0.5% of FCFS on mean e2e, even with 3000-4000 blocks.
+Ordering matters once a sustained queue forms:
+
+| workload | SJF mean e2e vs FCFS | SJF mean normalized e2e |
+|---|---|---|
+| sharegpt qps 24, 8500 blocks, 1000 req | −17% | −46% (decode-SJF: −55%) |
+| sharegpt qps 30, default cache, 1000 req | −24% | −49% (decode-SJF: −65%) |
+| azure_conv replay, native, 8500 blocks, 600 req | −6% | −6% |
+| azure_conv replay, qps 5, 4000 blocks, 300 req | −6% | −4% (decode-SJF: −6%) |
+
+8500 blocks is about the KV cache of Llama-3-8B on the paper's A100-40GB.
+`configs/rl/ppo_traces.yaml` trains on the first, third and fourth. The first
+has > 128 waiting requests in ~23% of decisions, so that config raises
+`max_queue_len` to 256 (beyond it, only the earliest arrivals are ranked).
+
+### Baseline assumptions
+
+`python -m vidur.rl.baselines --check-assumptions --workload ...` reports,
+per workload, each baseline relative to FCFS and the fraction of seeds where
+each claim holds, within 1% (ties count as holding). 10 seeds, on the
+three trace workloads and the two default ones
+(`rl_runs/baseline_checks/final_*.txt`):
+
+| relative to FCFS | sharegpt_q24_b8500 | azure_replay_b8500 | azure_replay_q5_b4000 | qps10_blocks4000 | qps20 |
+|---|---|---|---|---|---|
+| SJF total: mean e2e / p99 e2e / p99 TTFT | 0.83 / 1.00 / 2.02 | 0.94 / 0.98 / 1.39 | 0.95 / 1.00 / 1.49 | 0.71 / 1.20 / 1.54 | 0.95 / 1.02 / 1.17 |
+| SJF total age400 | 0.93 / 0.98 / 1.08 | 0.96 / 1.00 / 1.22 | 0.96 / 1.00 / 1.21 | 0.86 / 1.00 / 1.12 | 0.96 / 1.01 / 1.08 |
+| SJF decode: mean normalized / p99 normalized | 0.45 / 0.09 | 0.94 / 0.85 | 0.94 / 0.88 | 0.54 / 0.21 | 0.79 / 0.41 |
+
+- **SJF has the best mean: holds.** A plain SJF has the lowest mean e2e in
+  70-100% of seeds and the lowest mean normalized e2e in 80-100%. The best
+  key depends on the metric: total_tokens for e2e (prefill-heavy Azure),
+  decode_tokens for normalized e2e. Where it fails, aging SJF beats plain SJF
+  by < 1% (SJF is not optimal under continuous batching).
+- **FCFS has the lowest tail: holds for waiting time, not for e2e.**
+  - p99 TTFT: FCFS is best in 70-100% of seeds (40% at qps10_blocks4000,
+    where aging decode-SJF is 2% lower).
+  - p99 e2e: plain SJF is clearly worse (up to +20% total, +35% decode), but
+    aging SJF ties or beats FCFS: FCFS is best in only 10% of ShareGPT seeds,
+    where age100/age400 are 2% lower. The e2e tail is mostly service time,
+    not queueing.
+  - p99 normalized e2e: FCFS is almost never best; SJF cuts it 15-90%. The
+    per-token tail is short requests stuck behind long ones.
+  - So FCFS is a good tail *reference* for the hinge (achievable, not far
+    from the best), not a bound. Tail thresholds stay FCFS-derived.
+- **Aging SJF is the middle ground: holds on the mean, mostly on tails.**
+  Aging variants land between FCFS and SJF on mean e2e in 60-100% of seeds
+  (mostly >= 80%), and on p99 e2e / TTFT in 60-100% (one variant 40%). The exceptions are mostly aging doing
+  *better* than both ends on the e2e tail (so aging is closer to dominating
+  FCFS than trading off against it), plus max e2e under memory pressure
+  (qps10_blocks4000), where aging can be worse than both (age400: +14%)
+  because of preemption.
+
 ## 7. Open decisions
 
 1. Changing the tie-break default to arrival order changes current behavior (the

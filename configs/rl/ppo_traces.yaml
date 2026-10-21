@@ -1,0 +1,70 @@
+# PPO on the trace workloads (docs/rl_plan.md, "Trace workloads"): ShareGPT
+# lengths with Poisson arrivals, and seed-picked windows of the Azure 2023
+# conversation trace replayed with their real arrival times. Everything but
+# the workloads and max_queue_len matches ppo_default.yaml.
+#
+# Loads come from the baseline sweeps (python -m vidur.rl.baselines
+# --check-assumptions): with the default 80 GB KV cache ShareGPT barely
+# depends on ordering below ~25 qps, so it runs at a KV cache close to the
+# learning-to-rank paper's A100-40GB (8500 blocks) and above capacity.
+output_dir: rl_runs/ppo_traces
+seed: 0
+
+workloads:
+  # oracle SJF: -16% mean e2e, -42% mean normalized e2e vs FCFS
+  - {name: sharegpt_q24_b8500, trace: sharegpt, qps: 24, num_blocks: 8500, num_requests: 1000, weight: 1.0}
+  # native rate (5.5 qps on average, bursty); SJF: -6% mean e2e
+  - {name: azure_replay_b8500, trace: azure_conv, arrivals: trace, qps: null, num_blocks: 8500, num_requests: 600, weight: 1.0}
+  # memory pressure; SJF: -7% mean e2e
+  - {name: azure_replay_q5_b4000, trace: azure_conv, arrivals: trace, qps: 5, num_blocks: 4000, num_requests: 300, weight: 1.0}
+
+num_priority_levels: 16
+
+observation: {}
+
+reward:
+  weights: {e2e_normalized: 1.0, e2e_hinge: 0.3}
+  threshold_mode: reference_window
+  calibration_quantile: 0.95
+  reference_window_requests: 50
+  normalize_by_baselines: [fcfs]
+
+model:
+  encoder: transformer
+  head: ordinal
+  d_model: 64
+  num_layers: 2
+  num_heads: 4
+  shared_trunk: false
+  # sharegpt_q24_b8500 has > 128 waiting requests in ~23% of decisions
+  max_queue_len: 256
+  max_running_len: 128
+  init_middle_level_prob: 0.75
+
+ppo:
+  learning_rate: 3.0e-4
+  clip: 0.2
+  epochs: 4
+  minibatch_size: 128
+  tau_s: 25.0
+  gae_lambda: 0.95
+  advantage: group
+  advantage_normalization: workload
+  value_coef: 0.5
+  request_value_coef: 0.5
+  entropy_coef: 0.003
+  max_grad_norm: 0.5
+  target_kl: 0.05
+  device: auto
+  bucket_by_length: true
+
+iterations: 200
+seeds_per_iteration: 8
+group_size: 4
+num_workers: null
+eval_every: 10
+eval_seeds: [1000000, 1000001, 1000002, 1000003, 1000004]
+eval_decodings: [rank, argmax, sample]
+select_decoding: rank
+keep_eval_checkpoints: true
+wandb: false
