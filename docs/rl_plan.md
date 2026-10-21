@@ -941,9 +941,48 @@ Readings:
 - The approximate KL passed `target_kl` (0.05) in the first epoch for most of
   the first ~10 iterations, so those updates ran one epoch only.
 - Next:
-  - imitate `sjf_total_tokens_age400`, which is the stronger teacher under this
-    reward (`--set imitation.teacher=sjf_total_tokens_age400`)
+  - imitate `sjf_total_tokens_age400`, the stronger teacher under this reward
+    (done, below)
   - select fine-tuning checkpoints by `sample` at qps10_blocks4000, or add a
     rank-consistency term
   - diagnostic: an oracle output-length feature for the student only, to
     separate missing information from imitation error
+
+### Teacher at 400 tok/s aging (`rl_runs/imitation_sjf_age400`, `..._ppo`)
+
+Same pipeline and settings, `configs/rl/imitation_sjf_age400.yaml` (only the
+teacher and output dir differ). On the DAgger eval seeds (1000000–1000004) the
+teacher scores +0.124 vs FCFS. DAgger: 57K labeled decisions, train pair
+accuracy 0.97, eval pair agreement (`rank`) 0.88 → 0.96. Fine-tuning: 100 PPO
+iterations from `latest.pt`; approximate KL again passed `target_kl` for most of
+the first ~10 iterations.
+
+Held-out seeds 1000005–1000019, paired, mean ± s.e. (wins out of 15):
+
+| | qps10_blocks4000 | qps20 |
+|---|---|---|
+| imitation `rank`, vs FCFS | +0.097 ± 0.035 (10) | +0.068 ± 0.004 (15) |
+| imitation − teacher (16 lvl) | +0.058 ± 0.050 (8) | −0.004 ± 0.001 (4) |
+| imitation − prompt-only SJF 400 (16 lvl) | +0.021 ± 0.057 (4) | +0.007 ± 0.002 (13) |
+| imitation 400 − imitation 800 (`rank`) | +0.066 ± 0.027 (10) | +0.033 ± 0.003 (15) |
+| fine-tuned `latest` `rank` − imitation `rank` | −0.085 ± 0.042 (5) | +0.004 ± 0.002 (13) |
+| fine-tuned `best` (picked on eval seeds) `rank` − imitation `rank` | −0.071 ± 0.050 (7) | +0.004 ± 0.002 (10) |
+| fine-tuned `latest` `sample` − imitation `sample` | +0.007 ± 0.079 (7) | −0.007 ± 0.003 (4) |
+
+For reference on these seeds, vs FCFS: teacher 16 lvl +0.039 / +0.072, exact
+teacher +0.031 / +0.081, prompt-only SJF 400 +0.076 / +0.061.
+
+Readings:
+- **The 400 student is the best policy on this branch**: it beats the 800
+  student on both workloads (15/15 seeds at qps20) and matches or beats every
+  non-oracle baseline. At qps20 it closes almost all of the oracle teacher's
+  gain (+0.068 vs +0.072) without output lengths, and still beats prompt-only
+  SJF, so it uses information beyond the prompt.
+- At qps10_blocks4000 the oracle 400 teacher is *no better than* prompt-only
+  SJF (−0.037 ± 0.081); the per-seed spread is too large to rank them. The
+  student's +0.097 there is the highest of anything evaluated but within noise.
+- **Fine-tuning didn't help this time.** At qps20 it gains only +0.004 (vs
+  +0.009 from the 800 start, which had more headroom). At qps10_blocks4000
+  `rank` regressed again (−0.085), and unlike the 800 run `sample` didn't
+  improve either. With a good teacher, the imitation checkpoint is the one to
+  deploy; PPO at this setting mostly adds noise at qps10_blocks4000.
