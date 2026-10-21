@@ -32,10 +32,15 @@ class WorkloadConfig:
     """One kind of training/eval workload; kwargs go to make_simulation_config."""
 
     name: str
-    qps: float = 10.0
+    # with arrivals="trace", the trace-average rate (None = native)
+    qps: Optional[float] = 10.0
     num_blocks: Optional[int] = None
     num_requests: int = 300
     weight: float = 1.0
+    # a TRACE_FILES name (vidur/rl/env.py) or a path
+    trace: str = "azure_conv"
+    # "poisson", or "trace" to replay seed-picked windows of real arrivals
+    arrivals: str = "poisson"
     simulation: Dict[str, Any] = field(default_factory=dict)
 
     def make_env(
@@ -47,6 +52,8 @@ class WorkloadConfig:
     ) -> VidurSchedulingEnv:
         config = make_simulation_config(
             qps=self.qps,
+            trace_file=self.trace,
+            arrivals=self.arrivals,
             num_blocks=self.num_blocks,
             num_requests=self.num_requests,
             num_priority_levels=num_priority_levels,

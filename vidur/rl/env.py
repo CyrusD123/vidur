@@ -18,6 +18,7 @@ from vidur.config import (
     SimulationConfig,
     SyntheticRequestGeneratorConfig,
     TraceRequestLengthGeneratorConfig,
+    TraceWindowRequestGeneratorConfig,
 )
 from vidur.config.utils import get_all_subclasses
 from vidur.entities import Request
@@ -442,7 +443,10 @@ def _summarize(episode: Episode, end_time: float) -> Dict[str, float]:
         "p50_e2e": _quantile(e2e, 0.5),
         "p95_e2e": _quantile(e2e, 0.95),
         "p99_e2e": _quantile(e2e, 0.99),
+        "max_e2e": float(np.max(e2e)) if len(e2e) else float("nan"),
         "mean_e2e_normalized": mean(e2e_normalized),
+        "p95_e2e_normalized": _quantile(e2e_normalized, 0.95),
+        "p99_e2e_normalized": _quantile(e2e_normalized, 0.99),
         "mean_ttft": mean(ttft),
         "p95_ttft": _quantile(ttft, 0.95),
         "p99_ttft": _quantile(ttft, 0.99),
@@ -720,12 +724,68 @@ class VidurSchedulingEnv:
         return dataclasses.replace(reward_config, **updates)
 
 
+# trace names make_simulation_config accepts in place of a path
+TRACE_FILES = {
+    # Azure LLM inference trace 2023, conversation / code (via Splitwise);
+    # these have arrival times, so they also work with arrivals="trace"
+    "azure_conv": "./data/processed_traces/splitwise_conv.csv",
+    "azure_code": "./data/processed_traces/splitwise_code.csv",
+    # first-turn lengths, Llama-3 tokenizer (vidur/rl/prepare_traces.py)
+    "sharegpt": "./data/processed_traces/sharegpt_llama3_tokenizer.csv",
+    "lmsys": "./data/processed_traces/lmsys_llama3_tokenizer.csv",
+    "arxiv": "./data/processed_traces/arxiv_summarization_stats_llama2_tokenizer_filtered_v2.csv",
+}
+
+
+def make_request_generator_config(
+    trace_file: str = "azure_conv",
+    arrivals: str = "poisson",
+    qps: Optional[float] = 10.0,
+    num_requests: int = 300,
+    max_tokens: int = 4096,
+    seed: int = 42,
+) -> BaseRequestGeneratorConfig:
+    """
+    The workload: request lengths from `trace_file` (a TRACE_FILES name or a
+    path) and either
+      arrivals="poisson": Poisson arrivals at qps, lengths shuffled by seed;
+      arrivals="trace":   a seed-picked window of num_requests consecutive
+                          requests replayed with their real arrival times,
+                          time scaled so the whole trace averages qps
+                          (None = native rate).
+    """
+    trace_file = TRACE_FILES.get(trace_file, trace_file)
+    if arrivals == "trace":
+        return TraceWindowRequestGeneratorConfig(
+            seed=seed,
+            trace_file=trace_file,
+            num_requests=num_requests,
+            qps=qps,
+            max_tokens=max_tokens,
+        )
+    assert arrivals == "poisson", f"unknown arrivals {arrivals!r}"
+    return SyntheticRequestGeneratorConfig(
+        seed=seed,
+        num_requests=num_requests,
+        length_generator_config=TraceRequestLengthGeneratorConfig(
+            seed=seed,
+            trace_file=trace_file,
+            max_tokens=max_tokens,
+        ),
+        interval_generator_config=PoissonRequestIntervalGeneratorConfig(
+            seed=seed,
+            qps=qps,
+        ),
+    )
+
+
 def make_simulation_config(
     model_name: str = "meta-llama/Meta-Llama-3-8B",
     device: str = "a100",
-    trace_file: str = "./data/processed_traces/splitwise_conv.csv",
+    trace_file: str = "azure_conv",
+    arrivals: str = "poisson",
     max_tokens: int = 4096,
-    qps: float = 10.0,
+    qps: Optional[float] = 10.0,
     num_requests: int = 300,
     batch_size_cap: int = 256,
     max_num_batched_tokens: int = 2048,
@@ -738,8 +798,10 @@ def make_simulation_config(
     output_dir: str = "simulator_output",
 ) -> SimulationConfig:
     """
-    Single-replica rl_vllm config with Poisson arrivals and trace request
-    lengths, and metric collection turned off (the env computes its own stats).
+    Single-replica rl_vllm config with the workload from
+    make_request_generator_config (Poisson arrivals with trace request lengths
+    by default), and metric collection turned off (the env computes its own
+    stats).
     num_blocks=None sizes the KV cache from GPU memory; set it lower to force
     memory pressure and preemption.
     """
@@ -762,18 +824,13 @@ def make_simulation_config(
                 rerank_interval_s=rerank_interval_s,
             ),
         ),
-        request_generator_config=SyntheticRequestGeneratorConfig(
-            seed=seed,
+        request_generator_config=make_request_generator_config(
+            trace_file=trace_file,
+            arrivals=arrivals,
+            qps=qps,
             num_requests=num_requests,
-            length_generator_config=TraceRequestLengthGeneratorConfig(
-                seed=seed,
-                trace_file=trace_file,
-                max_tokens=max_tokens,
-            ),
-            interval_generator_config=PoissonRequestIntervalGeneratorConfig(
-                seed=seed,
-                qps=qps,
-            ),
+            max_tokens=max_tokens,
+            seed=seed,
         ),
         metrics_config=MetricsConfig(
             write_metrics=False,

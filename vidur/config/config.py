@@ -253,6 +253,38 @@ class TraceRequestGeneratorConfig(BaseRequestGeneratorConfig):
 
 
 @dataclass
+class TraceWindowRequestGeneratorConfig(BaseRequestGeneratorConfig):
+    """
+    Replays num_requests consecutive requests of an arrival trace, starting at
+    a row picked by the seed, so each seed is a different real window.
+    """
+
+    trace_file: str = field(
+        default="data/processed_traces/splitwise_conv.csv",
+        metadata={"help": "Trace with arrived_at and token counts."},
+    )
+    num_requests: int = field(
+        default=300,
+        metadata={"help": "Number of consecutive requests to replay."},
+    )
+    qps: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "Rescale time so the whole trace averages this rate (windows "
+            "keep their local burstiness). None replays the native rate."
+        },
+    )
+    max_tokens: int = field(
+        default=4096,
+        metadata={"help": "Maximum tokens per request (clipped proportionally)."},
+    )
+
+    @staticmethod
+    def get_type():
+        return RequestGeneratorType.TRACE_WINDOW
+
+
+@dataclass
 class BaseReplicaSchedulerConfig(BasePolyConfig):
     batch_size_cap: int = field(
         default=128,
