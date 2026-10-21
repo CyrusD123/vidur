@@ -1076,3 +1076,33 @@ Readings:
   `rank` regressed again (−0.085), and unlike the 800 run `sample` didn't
   improve either. With a good teacher, the imitation checkpoint is the one to
   deploy; PPO at this setting mostly adds noise at qps10_blocks4000.
+
+### Transfer to the trace workloads (not trained on)
+
+The age400 student (`rl_runs/imitation_sjf_age400/latest.pt`, trained only on
+qps10_blocks4000 and qps20) on the three trace workloads from `ppo_traces.yaml`,
+held-out seeds 1000005–1000019, paired, mean ± s.e. (wins out of 15):
+
+| student `rank` − | sharegpt_q24_b8500 | azure_replay_b8500 | azure_replay_q5_b4000 |
+|---|---|---|---|
+| FCFS | +0.120 ± 0.011 (15) | +0.000 ± 0.052 (11) | −0.001 ± 0.046 (9) |
+| teacher (exact) | −0.044 ± 0.005 (0) | −0.050 ± 0.042 (7) | −0.058 ± 0.049 (7) |
+| teacher (16 lvl) | −0.029 ± 0.004 (0) | −0.052 ± 0.042 (6) | −0.031 ± 0.048 (9) |
+| prompt-only SJF 400 (16 lvl) | −0.004 ± 0.003 (7) | −0.038 ± 0.033 (6) | −0.019 ± 0.046 (8) |
+
+- On ShareGPT the student keeps a clear gain over FCFS but drops to the
+  prompt-only heuristic, below its teacher on every seed. Part of this may be
+  the 128-request cap (`max_queue_len`; ShareGPT exceeds it in ~23% of
+  decisions, and the overflow is left in FCFS order).
+- On the Azure replays every policy's score is dominated by per-window
+  variance, so nothing is distinguishable. Mean e2e and TTFT drop for all the
+  SJF-like policies including the student (e.g. azure_replay_b8500 mean TTFT
+  3.29 s FCFS → 2.17 s student, 2.09 s teacher); the reward differences are
+  driven by the tail hinge.
+- CDFs: `python -m vidur.rl.plot_cdfs --checkpoint
+  rl_runs/imitation_sjf_age400/latest.pt --output-dir
+  rl_runs/cdf_plots_imitation_age400 --policies fcfs sjf_total_tokens_age400
+  sjf_prefill_tokens_age400_16lvl policy_rank --policy-label "Imitation
+  student (rank)" --seeds $(seq -f %.0f 1000005 1000019)`. On all five
+  workloads the student's curves sit on top of the teacher's and the
+  prompt-only heuristic's.
