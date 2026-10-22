@@ -1,0 +1,57 @@
+absolute (seed means)
+                                                  mean_e2e  mean_e2e_normalized  p99_e2e  max_e2e  p99_ttft  p99_e2e_normalized
+workload                 baseline                                                                                              
+sharegpt_q12_b8500_n1000 fcfs                        5.357                0.021   16.575   25.756     0.433               0.049
+                         sjf_total_tokens            5.356                0.021   16.575   25.739     0.391               0.049
+                         sjf_total_tokens_age100     5.356                0.021   16.575   25.739     0.391               0.049
+                         sjf_total_tokens_age400     5.356                0.021   16.575   25.739     0.391               0.049
+                         sjf_decode_tokens           5.355                0.021   16.566   25.751     0.427               0.049
+                         sjf_decode_tokens_age20     5.355                0.021   16.566   25.751     0.427               0.049
+                         sjf_decode_tokens_age80     5.355                0.021   16.566   25.751     0.427               0.049
+
+relative to FCFS (< 1 = better)
+                                                  mean_e2e  mean_e2e_normalized  p99_e2e  max_e2e  p99_ttft  p99_e2e_normalized
+workload                 baseline                                                                                              
+sharegpt_q12_b8500_n1000 fcfs                        1.000                1.000    1.000    1.000     1.000               1.000
+                         sjf_total_tokens            1.000                0.999    1.000    0.999     0.915               0.999
+                         sjf_total_tokens_age100     1.000                0.999    1.000    0.999     0.915               0.999
+                         sjf_total_tokens_age400     1.000                0.999    1.000    0.999     0.915               0.999
+                         sjf_decode_tokens           1.000                1.000    0.999    1.000     0.982               0.991
+                         sjf_decode_tokens_age20     1.000                1.000    0.999    1.000     0.982               0.991
+                         sjf_decode_tokens_age80     1.000                1.000    0.999    1.000     0.982               0.991
+
+fraction of seeds where each claim holds
+workload                                            sharegpt_q12_b8500_n1000
+claim                                                                       
+spread_mean_e2e                                                        0.000
+spread_mean_e2e_normalized                                             0.000
+fcfs_best_p99_e2e                                                      1.000
+fcfs_best_max_e2e                                                      1.000
+fcfs_best_p99_ttft                                                     0.400
+fcfs_best_p99_e2e_normalized                                           0.800
+sjf_best_mean_e2e                                                      1.000
+sjf_best_mean_e2e_normalized                                           1.000
+sjf_total_tokens_age100_between_mean_e2e                               1.000
+sjf_total_tokens_age100_between_mean_e2e_normal...                     1.000
+sjf_total_tokens_age100_between_p99_e2e                                1.000
+sjf_total_tokens_age100_between_max_e2e                                1.000
+sjf_total_tokens_age100_between_p99_ttft                               1.000
+sjf_total_tokens_age100_between_p99_e2e_normalized                     1.000
+sjf_total_tokens_age400_between_mean_e2e                               1.000
+sjf_total_tokens_age400_between_mean_e2e_normal...                     1.000
+sjf_total_tokens_age400_between_p99_e2e                                1.000
+sjf_total_tokens_age400_between_max_e2e                                1.000
+sjf_total_tokens_age400_between_p99_ttft                               1.000
+sjf_total_tokens_age400_between_p99_e2e_normalized                     1.000
+sjf_decode_tokens_age20_between_mean_e2e                               1.000
+sjf_decode_tokens_age20_between_mean_e2e_normal...                     1.000
+sjf_decode_tokens_age20_between_p99_e2e                                1.000
+sjf_decode_tokens_age20_between_max_e2e                                1.000
+sjf_decode_tokens_age20_between_p99_ttft                               1.000
+sjf_decode_tokens_age20_between_p99_e2e_normalized                     1.000
+sjf_decode_tokens_age80_between_mean_e2e                               1.000
+sjf_decode_tokens_age80_between_mean_e2e_normal...                     1.000
+sjf_decode_tokens_age80_between_p99_e2e                                1.000
+sjf_decode_tokens_age80_between_max_e2e                                1.000
+sjf_decode_tokens_age80_between_p99_ttft                               1.000
+sjf_decode_tokens_age80_between_p99_e2e_normalized                     1.000

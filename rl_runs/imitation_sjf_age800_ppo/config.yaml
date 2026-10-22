@@ -1,0 +1,85 @@
+workloads:
+- name: qps10_blocks4000
+  qps: 10
+  num_blocks: 4000
+  num_requests: 300
+  weight: 1.0
+- name: qps20
+  qps: 20
+  num_requests: 300
+  weight: 1.0
+eval_workloads: null
+observation: {}
+reward:
+  weights:
+    e2e_normalized: 1.0
+    e2e_hinge: 0.3
+  threshold_mode: reference_window
+  calibration_quantile: 0.95
+  reference_window_requests: 50
+  normalize_by_baselines:
+  - fcfs
+model:
+  encoder: transformer
+  head: ordinal
+  d_model: 64
+  num_layers: 2
+  num_heads: 4
+  shared_trunk: false
+  max_queue_len: 128
+  max_running_len: 128
+  init_middle_level_prob: 0.25
+ppo:
+  imitation_coef: 0.1
+  learning_rate: 0.0001
+  clip: 0.2
+  epochs: 4
+  minibatch_size: 128
+  tau_s: 25.0
+  gae_lambda: 0.95
+  advantage: group
+  advantage_normalization: workload
+  value_coef: 0.5
+  request_value_coef: 0.5
+  entropy_coef: 0.001
+  max_grad_norm: 0.5
+  target_kl: 0.05
+  device: auto
+  bucket_by_length: true
+imitation:
+  teacher: sjf_total_tokens_age800
+  iterations: 10
+  initial_seeds: 64
+  seeds_per_iteration: 32
+  beta_start: 0.5
+  beta_decay: 0.5
+  collect_decoding: rank
+  epochs_per_iteration: 2
+  eval_every: 1
+  learning_rate: 0.0003
+  minibatch_size: 128
+  level_coef: 1.0
+  rank_coef: 1.0
+init_checkpoint: rl_runs/imitation_sjf_age800/latest.pt
+num_priority_levels: 16
+iterations: 100
+seeds_per_iteration: 8
+group_size: 4
+num_workers: null
+eval_every: 10
+eval_decodings:
+- rank
+- argmax
+- sample
+select_decoding: rank
+keep_eval_checkpoints: true
+eval_seeds:
+- 1000000
+- 1000001
+- 1000002
+- 1000003
+- 1000004
+seed: 0
+output_dir: rl_runs/imitation_sjf_age800_ppo
+wandb: false
+wandb_project: vidur-rl

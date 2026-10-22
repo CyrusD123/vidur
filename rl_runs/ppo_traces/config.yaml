@@ -1,0 +1,80 @@
+workloads:
+- name: sharegpt_q24_b8500
+  trace: sharegpt
+  qps: 24
+  num_blocks: 8500
+  num_requests: 1000
+  weight: 1.0
+- name: azure_replay_b8500
+  trace: azure_conv
+  arrivals: trace
+  qps: null
+  num_blocks: 8500
+  num_requests: 600
+  weight: 1.0
+- name: azure_replay_q5_b4000
+  trace: azure_conv
+  arrivals: trace
+  qps: 5
+  num_blocks: 4000
+  num_requests: 300
+  weight: 1.0
+eval_workloads: null
+observation: {}
+reward:
+  weights:
+    e2e_normalized: 1.0
+    e2e_hinge: 0.3
+  threshold_mode: reference_window
+  calibration_quantile: 0.95
+  reference_window_requests: 50
+  normalize_by_baselines:
+  - fcfs
+model:
+  encoder: transformer
+  head: ordinal
+  d_model: 64
+  num_layers: 2
+  num_heads: 4
+  shared_trunk: false
+  max_queue_len: 256
+  max_running_len: 128
+  init_middle_level_prob: 0.75
+ppo:
+  learning_rate: 0.0003
+  clip: 0.2
+  epochs: 4
+  minibatch_size: 128
+  tau_s: 25.0
+  gae_lambda: 0.95
+  advantage: group
+  advantage_normalization: workload
+  value_coef: 0.5
+  request_value_coef: 0.5
+  entropy_coef: 0.003
+  max_grad_norm: 0.5
+  target_kl: 0.05
+  device: auto
+  bucket_by_length: true
+num_priority_levels: 16
+iterations: 200
+seeds_per_iteration: 8
+group_size: 4
+num_workers: null
+eval_every: 10
+eval_decodings:
+- rank
+- argmax
+- sample
+select_decoding: rank
+keep_eval_checkpoints: true
+eval_seeds:
+- 1000000
+- 1000001
+- 1000002
+- 1000003
+- 1000004
+seed: 0
+output_dir: rl_runs/ppo_traces
+wandb: false
+wandb_project: vidur-rl

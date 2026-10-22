@@ -1,0 +1,47 @@
+checkpoint: rl_runs/imitation_sjf_age400/latest.pt
+seeds:
+- 1000005
+- 1000006
+- 1000007
+- 1000008
+- 1000009
+- 1000010
+- 1000011
+- 1000012
+- 1000013
+- 1000014
+- 1000015
+- 1000016
+- 1000017
+- 1000018
+- 1000019
+policies:
+- fcfs
+- sjf_total_tokens_age400
+- sjf_prefill_tokens_age400_16lvl
+- policy_rank
+workloads:
+- name: qps10_blocks4000
+  qps: 10
+  num_blocks: 4000
+  num_requests: 300
+- name: qps20
+  qps: 20
+  num_requests: 300
+- name: sharegpt_q24_b8500
+  trace: sharegpt
+  qps: 24
+  num_blocks: 8500
+  num_requests: 1000
+- name: azure_replay_q5_b4000
+  trace: azure_conv
+  arrivals: trace
+  qps: 5
+  num_blocks: 4000
+  num_requests: 300
+- name: azure_replay_b8500
+  trace: azure_conv
+  arrivals: trace
+  qps: null
+  num_blocks: 8500
+  num_requests: 600
