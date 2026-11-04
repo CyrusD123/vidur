@@ -1,0 +1,8 @@
+# rl_runs/cdf_plots workloads with loads matched for Frontier (H200 + Llama-2-7B,
+# configs/rl/frontier_run2.yaml): each matches the Vidur workload's FCFS mean
+# e2e, FCFS-to-SJF headroom and TTFT regime on seed 1000000.
+- {name: qps20_blocks4000, qps: 20, num_blocks: 4000, num_requests: 300}  # Vidur qps10_blocks4000
+- {name: qps60, qps: 60, num_requests: 300}  # Vidur qps20
+- {name: sharegpt_q48_b8500, trace: sharegpt, qps: 48, num_blocks: 8500, num_requests: 1000}  # Vidur sharegpt_q24_b8500
+- {name: azure_replay_q10_b4000, trace: azure_conv, arrivals: trace, qps: 10, num_blocks: 4000, num_requests: 300}  # Vidur azure_replay_q5_b4000
+- {name: azure_replay_q12_b8500, trace: azure_conv, arrivals: trace, qps: 12, num_blocks: 8500, num_requests: 600}  # Vidur azure_replay_b8500 (native 5.5 qps)

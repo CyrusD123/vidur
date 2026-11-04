@@ -5,6 +5,11 @@ for baselines and a trained policy, pooled over seeds:
     python -m vidur.rl.plot_cdfs --checkpoint rl_runs/run2/best.pt \\
         --output-dir rl_runs/cdf_plots
 
+--backend frontier simulates every workload in Frontier instead
+(vidur/rl/frontier_env.py), with the checkpoint's Frontier settings if it was
+trained there. --workloads replaces WORKLOADS with a YAML list of the same
+form (e.g. configs/rl/frontier_cdf_workloads.yaml).
+
 Raw samples are cached per (workload, policy) in <output-dir>/data, so
 re-plotting skips the simulation. Writes two comparisons:
     fcfs_vs_sjf/<workload>/<metric>.png
@@ -79,10 +84,20 @@ def _record_batch_sizes(sizes: List[int]) -> None:
     RLVLLMReplicaScheduler.on_batch_end = wrapped
 
 
+def _frontier_settings(train_config: TrainConfig) -> Dict:
+    settings = [w.get("frontier", {}) for w in train_config.workloads]
+    assert all(s == settings[0] for s in settings), "workloads differ in frontier settings"
+    return settings[0]
+
+
 def run_workload(args) -> str:
-    workload, checkpoint_path, seeds, data_dir = args
+    workload, checkpoint_path, seeds, data_dir, backend = args
     checkpoint = load_checkpoint(checkpoint_path)
     train_config = TrainConfig(**checkpoint["train_config"])
+    if backend == "frontier":
+        workload = dict(
+            workload, backend="frontier", frontier=_frontier_settings(train_config)
+        )
     env = WorkloadConfig(**workload).make_env(
         RewardConfig(),
         train_config.observation_config(),
@@ -107,7 +122,10 @@ def run_workload(args) -> str:
             episode = env.run_episode(agent, seed, reward_config=RewardConfig())
             for name, values in episode_metric_samples(episode).items():
                 samples[name].append(values)
-            samples["batch_size"].append(np.array(batch_sizes))
+            # Frontier episodes record their own
+            samples["batch_size"].append(
+                getattr(episode, "batch_sizes", np.array(batch_sizes))
+            )
             print(
                 f"{workload['name']} {policy} seed {seed}: "
                 f"mean e2e {episode.summary['mean_e2e']:.2f}s",
@@ -149,7 +167,9 @@ def plot_cdf(ax, samples, policies: Sequence[str], metric: str) -> None:
     ax.legend(loc="lower right", fontsize=8, frameon=False)
 
 
-def plot_all(output_dir: str, data_dir: str, seeds: Sequence[int]) -> None:
+def plot_all(
+    output_dir: str, data_dir: str, seeds: Sequence[int], backend: str = "vidur"
+) -> None:
     for comparison, policies in COMPARISONS.items():
         for workload in WORKLOADS:
             name = workload["name"]
@@ -157,6 +177,8 @@ def plot_all(output_dir: str, data_dir: str, seeds: Sequence[int]) -> None:
             directory = os.path.join(output_dir, comparison, name)
             os.makedirs(directory, exist_ok=True)
             suffix = f"{name}, {len(seeds)} seeds pooled"
+            if backend != "vidur":
+                suffix = f"{backend}: {suffix}"
             for metric in METRICS:
                 fig, ax = plt.subplots(figsize=(6.4, 4.2))
                 plot_cdf(ax, samples, policies, metric)
@@ -181,20 +203,27 @@ def main() -> None:
         "--seeds", type=int, nargs="*", default=list(range(1000000, 1000005))
     )
     parser.add_argument("--workers", type=int, default=len(WORKLOADS))
+    parser.add_argument("--backend", choices=("vidur", "frontier"), default="vidur")
+    parser.add_argument("--workloads", default=None, help="YAML list of workloads")
     args = parser.parse_args()
+    if args.workloads:
+        with open(args.workloads) as f:
+            WORKLOADS[:] = yaml.safe_load(f)
 
     data_dir = os.path.join(args.output_dir, "data")
     os.makedirs(data_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "workloads.yaml"), "w") as f:
         yaml.safe_dump(
             {"checkpoint": args.checkpoint, "seeds": args.seeds,
-             "workloads": WORKLOADS}, f, sort_keys=False,
+             "backend": args.backend, "workloads": WORKLOADS}, f, sort_keys=False,
         )
-    tasks = [(w, args.checkpoint, args.seeds, data_dir) for w in WORKLOADS]
+    tasks = [
+        (w, args.checkpoint, args.seeds, data_dir, args.backend) for w in WORKLOADS
+    ]
     with mp.get_context("spawn").Pool(args.workers) as pool:
         for name in pool.imap_unordered(run_workload, tasks):
             print(f"done: {name}", flush=True)
-    plot_all(args.output_dir, data_dir, args.seeds)
+    plot_all(args.output_dir, data_dir, args.seeds, args.backend)
 
 
 if __name__ == "__main__":

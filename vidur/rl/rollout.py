@@ -42,6 +42,10 @@ class WorkloadConfig:
     # "poisson", or "trace" to replay seed-picked windows of real arrivals
     arrivals: str = "poisson"
     simulation: Dict[str, Any] = field(default_factory=dict)
+    # "vidur", or "frontier" to simulate episodes in Frontier
+    # (vidur/rl/frontier_env.py) with the `frontier` settings
+    backend: str = "vidur"
+    frontier: Dict[str, Any] = field(default_factory=dict)
 
     def make_env(
         self,
@@ -60,6 +64,17 @@ class WorkloadConfig:
             output_dir=output_dir,
             **self.simulation,
         )
+        if self.backend == "frontier":
+            from vidur.rl.frontier_env import FrontierEnv
+
+            return FrontierEnv(
+                config,
+                self.frontier,
+                reward_config,
+                observation_config,
+                num_priority_levels,
+            )
+        assert self.backend == "vidur", f"unknown backend {self.backend!r}"
         return VidurSchedulingEnv(config, reward_config, observation_config)
 
 
