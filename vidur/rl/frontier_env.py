@@ -26,6 +26,10 @@ admits a request when its first chunk fits (Vidur: its whole prompt), and in
 priority mode it preempts the running request with the largest (priority,
 arrival), so a request's priority still matters after admission (Vidur
 preempts the most recently admitted one).
+
+Importing this module swaps sklearn's single-row forest prediction for
+vidur/rl/fast_forest.py (bit-identical, ~10x faster episodes); set
+VIDUR_FRONTIER_FAST_FOREST=0 to keep sklearn's.
 """
 
 import copy
@@ -43,6 +47,7 @@ import pandas as pd
 from vidur.config import SimulationConfig
 from vidur.entities.replica import Replica
 from vidur.request_generator import RequestGeneratorRegistry
+from vidur.rl import fast_forest
 from vidur.rl.action import admission_action_bounds
 from vidur.rl.agents import BaseAgent
 from vidur.rl.env import (
@@ -96,6 +101,9 @@ from frontier.scheduler.replica_scheduler.replica_scheduler_registry import (  #
 )
 from frontier.types import ReplicaSchedulerType  # noqa: E402
 from frontier.utils.random import set_seeds  # noqa: E402
+
+if os.environ.get("VIDUR_FRONTIER_FAST_FOREST", "1") != "0":
+    fast_forest.install()
 
 # WorkloadSpec fields (frontier/rl/env.py) a workload's `frontier` dict can set.
 # Llama-2-7B on H200 is the dense model Frontier has full profiles for (mixed
