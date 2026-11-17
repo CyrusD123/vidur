@@ -1,0 +1,93 @@
+# Imitation of oracle aging SJF, then PPO fine-tuning (docs/rl_plan.md §8):
+#   python -m vidur.rl.imitation --config configs/rl/imitation_sjf_age400.yaml
+#   python -m vidur.rl.train --config configs/rl/imitation_sjf_age400.yaml \
+#       --set init_checkpoint=rl_runs/imitation_sjf_age400/best.pt \
+#       --set output_dir=rl_runs/imitation_sjf_age400_ppo
+# Same sections as ppo_default.yaml, plus imitation -> ImitationConfig
+# (vidur/rl/imitation.py). The ppo section is only used by the fine-tuning run.
+output_dir: rl_runs/imitation_sjf_age400
+seed: 0
+
+# Workloads are sampled by weight. Ordering matters most under KV-memory
+# pressure (qps 10 / 4000 blocks); qps 20 with the default cache is overloaded
+# but has less to gain. Extra make_simulation_config kwargs go under
+# `simulation` (e.g. trace_file).
+workloads:
+  - {name: qps10_blocks4000, qps: 10, num_blocks: 4000, num_requests: 300, weight: 1.0}
+  - {name: qps20, qps: 20, num_requests: 300, weight: 1.0}
+
+num_priority_levels: 16
+
+observation: {}  # default features (vidur/rl/observation.py)
+
+# Recommended start from the reward weight check (docs/rl_plan.md §2):
+# mean normalized latency + e2e tail hinge against FCFS's local p95
+reward:
+  weights: {e2e_normalized: 1.0, e2e_hinge: 0.3}
+  threshold_mode: reference_window
+  calibration_quantile: 0.95
+  reference_window_requests: 50
+  normalize_by_baselines: [fcfs]
+
+model:
+  encoder: transformer
+  head: ordinal
+  d_model: 64
+  num_layers: 2
+  num_heads: 4
+  shared_trunk: false
+  max_queue_len: 128
+  max_running_len: 128
+  # imitation fits levels across the whole range, so start spread out (25% on
+  # the middle level; ppo_default.yaml uses 0.75 to start near FCFS)
+  init_middle_level_prob: 0.25
+
+# DAgger: teacher rollouts first, then mixtures with the student (beta = teacher
+# probability, 0.5, 0.25, ...). The teacher reads true output lengths; the
+# student's observation does not.
+imitation:
+  teacher: sjf_total_tokens_age400
+  iterations: 10
+  initial_seeds: 64
+  seeds_per_iteration: 32
+  beta_start: 0.5
+  beta_decay: 0.5
+  collect_decoding: rank
+  epochs_per_iteration: 2
+  eval_every: 1
+  learning_rate: 3.0e-4
+  minibatch_size: 128
+  level_coef: 1.0
+  rank_coef: 1.0
+
+# fine-tuning from the imitation policy: smaller steps than from scratch, and
+# the imitation loss as an anchor (teacher labels on the PPO rollouts)
+ppo:
+  imitation_coef: 0.1
+  learning_rate: 1.0e-4
+  clip: 0.2
+  epochs: 4
+  minibatch_size: 128
+  tau_s: 25.0        # effect horizon from the fork experiment (§4)
+  gae_lambda: 0.95
+  advantage: group   # time-aligned leave-one-out over group_size rollouts
+  advantage_normalization: workload   # unit std per workload, not per batch
+  value_coef: 0.5
+  request_value_coef: 0.5
+  entropy_coef: 0.001
+  max_grad_norm: 0.5
+  target_kl: 0.05
+  device: auto           # learner: cuda, then mps, then cpu
+  bucket_by_length: true # minibatches of similar-size states (less padding)
+
+iterations: 100
+seeds_per_iteration: 8
+group_size: 4
+num_workers: null   # all cores but two
+eval_every: 10
+eval_seeds: [1000000, 1000001, 1000002, 1000003, 1000004]
+# logged as eval/<decoding>/...; best.pt is picked by select_decoding
+eval_decodings: [rank, argmax, sample]
+select_decoding: rank
+keep_eval_checkpoints: true
+wandb: false

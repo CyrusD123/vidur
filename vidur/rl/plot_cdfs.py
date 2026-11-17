@@ -10,11 +10,22 @@ for baselines and a trained policy, pooled over seeds:
 trained there. --workloads replaces WORKLOADS with a YAML list of the same
 form (e.g. configs/rl/frontier_cdf_workloads.yaml).
 
+--policies picks the lines (baseline names, and policy_rank for the
+checkpoint), e.g. an imitation student against its teacher:
+
+    python -m vidur.rl.plot_cdfs \\
+        --checkpoint rl_runs/imitation_sjf_age400/latest.pt \\
+        --output-dir rl_runs/cdf_plots_imitation_age400 \\
+        --policies fcfs sjf_total_tokens_age400 \\
+            sjf_prefill_tokens_age400_16lvl policy_rank \\
+        --policy-label "Imitation student (rank)"
+
 Raw samples are cached per (workload, policy) in <output-dir>/data, so
-re-plotting skips the simulation. Writes two comparisons:
-    fcfs_vs_sjf/<workload>/<metric>.png
+re-plotting skips the simulation. Writes
     all_policies/<workload>/<metric>.png
-plus a 2x2 overview.png per workload in each.
+and, when both are among the policies,
+    fcfs_vs_sjf/<workload>/<metric>.png
+plus a 1x4 overview.png per workload in each.
 """
 
 import argparse
@@ -49,21 +60,19 @@ WORKLOADS = [
      "qps": None, "num_blocks": 8500, "num_requests": 600},
 ]
 POLICIES = ("fcfs", "sjf_total_tokens", "sjf_total_tokens_age400", "policy_rank")
-COMPARISONS = {
-    "fcfs_vs_sjf": ("fcfs", "sjf_total_tokens"),
-    "all_policies": POLICIES,
-}
 LABELS = {
     "fcfs": "FCFS",
     "sjf_total_tokens": "SJF (total tokens)",
     "sjf_total_tokens_age400": "SJF + aging 400 tok/s",
+    "sjf_prefill_tokens_age400_16lvl": "Prompt-only SJF + aging 400 (16 lvl)",
     "policy_rank": "RL policy (rank)",
 }
-# validated categorical slots 1-4, plus line style so identity isn't color alone
+# validated categorical slots 1-5, plus line style so identity isn't color alone
 STYLES = {
     "fcfs": ("#2a78d6", "-"),
     "sjf_total_tokens": ("#eb6834", "--"),
     "sjf_total_tokens_age400": ("#1baf7a", "-."),
+    "sjf_prefill_tokens_age400_16lvl": ("#8a5cd6", "--"),
     "policy_rank": ("#eda100", ":"),
 }
 METRICS = {
@@ -91,7 +100,7 @@ def _frontier_settings(train_config: TrainConfig) -> Dict:
 
 
 def run_workload(args) -> str:
-    workload, checkpoint_path, seeds, data_dir, backend = args
+    workload, checkpoint_path, seeds, data_dir, backend, policies = args
     checkpoint = load_checkpoint(checkpoint_path)
     train_config = TrainConfig(**checkpoint["train_config"])
     if backend == "frontier":
@@ -107,7 +116,7 @@ def run_workload(args) -> str:
     batch_sizes: List[int] = []
     _record_batch_sizes(batch_sizes)
 
-    for policy in POLICIES:
+    for policy in policies:
         path = os.path.join(data_dir, f"{workload['name']}__{policy}.npz")
         if os.path.exists(path):
             continue
@@ -135,10 +144,12 @@ def run_workload(args) -> str:
     return workload["name"]
 
 
-def load_samples(data_dir: str, workload: str) -> Dict[str, Dict[str, np.ndarray]]:
+def load_samples(
+    data_dir: str, workload: str, policies: Sequence[str]
+) -> Dict[str, Dict[str, np.ndarray]]:
     return {
         policy: dict(np.load(os.path.join(data_dir, f"{workload}__{policy}.npz")))
-        for policy in POLICIES
+        for policy in policies
     }
 
 
@@ -167,13 +178,24 @@ def plot_cdf(ax, samples, policies: Sequence[str], metric: str) -> None:
     ax.legend(loc="lower right", fontsize=8, frameon=False)
 
 
+def comparisons(policies: Sequence[str]) -> Dict[str, Sequence[str]]:
+    result = {"all_policies": tuple(policies)}
+    if "fcfs" in policies and "sjf_total_tokens" in policies:
+        result["fcfs_vs_sjf"] = ("fcfs", "sjf_total_tokens")
+    return result
+
+
 def plot_all(
-    output_dir: str, data_dir: str, seeds: Sequence[int], backend: str = "vidur"
+    output_dir: str,
+    data_dir: str,
+    seeds: Sequence[int],
+    policies: Sequence[str],
+    backend: str = "vidur",
 ) -> None:
-    for comparison, policies in COMPARISONS.items():
+    for comparison, compared in comparisons(policies).items():
         for workload in WORKLOADS:
             name = workload["name"]
-            samples = load_samples(data_dir, name)
+            samples = load_samples(data_dir, name, compared)
             directory = os.path.join(output_dir, comparison, name)
             os.makedirs(directory, exist_ok=True)
             suffix = f"{name}, {len(seeds)} seeds pooled"
@@ -181,14 +203,14 @@ def plot_all(
                 suffix = f"{backend}: {suffix}"
             for metric in METRICS:
                 fig, ax = plt.subplots(figsize=(6.4, 4.2))
-                plot_cdf(ax, samples, policies, metric)
+                plot_cdf(ax, samples, compared, metric)
                 ax.set_title(f"{METRICS[metric]} — {suffix}", fontsize=10)
                 fig.tight_layout()
                 fig.savefig(os.path.join(directory, f"{metric}.png"), dpi=150)
                 plt.close(fig)
             fig, axes = plt.subplots(1, 4, figsize=(22, 4.4))
             for ax, metric in zip(axes, METRICS):
-                plot_cdf(ax, samples, policies, metric)
+                plot_cdf(ax, samples, compared, metric)
             fig.suptitle(suffix)
             fig.tight_layout()
             fig.savefig(os.path.join(directory, "overview.png"), dpi=120)
@@ -205,25 +227,33 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=len(WORKLOADS))
     parser.add_argument("--backend", choices=("vidur", "frontier"), default="vidur")
     parser.add_argument("--workloads", default=None, help="YAML list of workloads")
+    parser.add_argument("--policies", nargs="+", default=list(POLICIES))
+    parser.add_argument("--policy-label", default=LABELS["policy_rank"])
     args = parser.parse_args()
     if args.workloads:
         with open(args.workloads) as f:
             WORKLOADS[:] = yaml.safe_load(f)
+    unknown = sorted(set(args.policies) - set(STYLES))
+    assert not unknown, f"add {unknown} to LABELS and STYLES"
+    LABELS["policy_rank"] = args.policy_label
 
     data_dir = os.path.join(args.output_dir, "data")
     os.makedirs(data_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "workloads.yaml"), "w") as f:
         yaml.safe_dump(
             {"checkpoint": args.checkpoint, "seeds": args.seeds,
-             "backend": args.backend, "workloads": WORKLOADS}, f, sort_keys=False,
+             "backend": args.backend, "policies": args.policies,
+             "workloads": WORKLOADS},
+            f, sort_keys=False,
         )
     tasks = [
-        (w, args.checkpoint, args.seeds, data_dir, args.backend) for w in WORKLOADS
+        (w, args.checkpoint, args.seeds, data_dir, args.backend, args.policies)
+        for w in WORKLOADS
     ]
     with mp.get_context("spawn").Pool(args.workers) as pool:
         for name in pool.imap_unordered(run_workload, tasks):
             print(f"done: {name}", flush=True)
-    plot_all(args.output_dir, data_dir, args.seeds, args.backend)
+    plot_all(args.output_dir, data_dir, args.seeds, args.policies, args.backend)
 
 
 if __name__ == "__main__":
