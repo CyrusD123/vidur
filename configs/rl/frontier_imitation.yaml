@@ -1,0 +1,171 @@
+# Imitation of uncached-prompt aging SJF, then PPO fine-tuning, on Frontier with
+# the frontier_synthetic.yaml workloads (train synthetic:random, eval on real
+# TraceLab / FreeInference traces):
+#   PYTHONPATH=$PWD ../Frontier/.venv/bin/python -m vidur.rl.imitation \
+#       --config configs/rl/frontier_imitation.yaml
+#   PYTHONPATH=$PWD ../Frontier/.venv/bin/python -m vidur.rl.train \
+#       --config configs/rl/frontier_imitation.yaml \
+#       --set init_checkpoint=rl_runs/frontier_imitation/best.pt \
+#       --set output_dir=rl_runs/frontier_imitation_ppo
+#
+# Teacher: sjf_prefill_tokens_age200 ranks by uncached prompt tokens minus
+# 200 * seconds waited. Not an oracle (a server knows its uncached prompt), so
+# the student can match it exactly. On the eval traces it matches oracle
+# sjf_total_tokens_age200 (mean e2e within ~2%, similar p99).
+#
+# Reward: e2e_hinge weight 0.03 instead of 0.3. Weight check (2026-11-17):
+# at 0.3 the hinge is 2-3x FCFS's mean term and every SJF variant scores below
+# FCFS (best: this teacher at -0.26 on the eval traces), so PPO's optimum was
+# FCFS. Improvement over FCFS at 0.03:
+#                     eval traces (4 x 5 seeds)   synthetic:random (8 seeds)
+#   prefill age200    +0.11 (all 4 > 0)           +0.24 (all 8 > 0)
+#   prefill age50     +0.07                       +0.24
+#   plain SJF         -0.07                       +0.11
+#   FCFS               0                           0
+# 0.02 favours plain SJF / age50 on the training seeds; 0.05 makes the
+# teacher lose to FCFS on the FreeInference eval traces.
+workloads:
+- name: synthetic_random
+  trace: synthetic:random
+  arrivals: sessions
+  qps: 1.5
+  num_requests: 150
+  num_blocks: 28318
+  weight: 1.0
+  simulation: &sim
+    max_tokens: 131072
+  backend: frontier
+  frontier: &frontier
+    model: llama3.1-8b
+    device: a100
+    network_device: a100_dgx
+    # the A100 profile has no CPU-overhead tables
+    model_cpu_overhead: false
+    prediction_rounding_bits: 5
+    enable_prefix_caching: true
+    extra_args:
+    - --vllm_v1_scheduler_config_max_model_len
+    - '131072'
+    - --random_forrest_execution_time_predictor_config_prediction_max_batch_size
+    - '256'
+eval_workloads:
+- name: tracelab_q1
+  trace: tracelab
+  arrivals: sessions
+  qps: 1
+  num_requests: 150
+  num_blocks: 28318
+  weight: 1.0
+  simulation: *sim
+  backend: frontier
+  frontier: *frontier
+- name: tracelab_q2
+  trace: tracelab
+  arrivals: sessions
+  qps: 2
+  num_requests: 150
+  num_blocks: 28318
+  weight: 1.0
+  simulation: *sim
+  backend: frontier
+  frontier: *frontier
+- name: freeinference_q1
+  trace: freeinference
+  arrivals: sessions
+  qps: 1
+  num_requests: 150
+  num_blocks: 28318
+  weight: 1.0
+  simulation: *sim
+  backend: frontier
+  frontier: *frontier
+- name: freeinference_q2
+  trace: freeinference
+  arrivals: sessions
+  qps: 2
+  num_requests: 150
+  num_blocks: 28318
+  weight: 1.0
+  simulation: *sim
+  backend: frontier
+  frontier: *frontier
+observation:
+  prefix_cache: true
+reward:
+  weights:
+    e2e_normalized: 1.0
+    e2e_hinge: 0.03
+  threshold_mode: reference_window
+  calibration_quantile: 0.95
+  # one threshold per episode (see frontier_synthetic.yaml)
+  reference_window_requests: 100000
+  normalize_by_baselines:
+  - fcfs
+model:
+  encoder: transformer
+  head: ordinal
+  d_model: 64
+  num_layers: 2
+  num_heads: 4
+  shared_trunk: false
+  max_queue_len: 128
+  max_running_len: 128
+  # imitation fits levels across the whole range, so start spread out
+  init_middle_level_prob: 0.25
+# DAgger: teacher rollouts first, then teacher/student mixtures (beta 0.5,
+# 0.25, ...). Sized for ~1 h on 8 workers (~11 s per episode effective):
+# 20 teacher eval + 48 + 6 * 24 collection + 3 * 60 eval episodes.
+imitation:
+  teacher: sjf_prefill_tokens_age200
+  iterations: 6
+  initial_seeds: 48
+  seeds_per_iteration: 24
+  beta_start: 0.5
+  beta_decay: 0.5
+  collect_decoding: rank
+  epochs_per_iteration: 2
+  eval_every: 2
+  learning_rate: 0.0003
+  minibatch_size: 128
+  level_coef: 1.0
+  rank_coef: 1.0
+# fine-tuning: smaller steps than from scratch (frontier_synthetic hit the KL
+# limit after one epoch from iteration 44 at 3e-4), imitation loss as anchor
+ppo:
+  imitation_coef: 0.1
+  learning_rate: 0.0001
+  clip: 0.2
+  epochs: 4
+  minibatch_size: 128
+  tau_s: 25.0
+  gae_lambda: 0.95
+  advantage: group
+  advantage_normalization: workload
+  value_coef: 0.5
+  request_value_coef: 0.5
+  entropy_coef: 0.001
+  max_grad_norm: 0.5
+  target_kl: 0.05
+  device: auto
+  bucket_by_length: true
+num_priority_levels: 16
+# PPO fine-tuning sized for ~7 h: frontier_synthetic ran ~8.4 min per
+# iteration on 8 workers with eval every 5 (imitation took ~1.4 h, not 1)
+iterations: 50
+seeds_per_iteration: 8
+group_size: 4
+num_workers: 8
+eval_every: 5
+eval_seeds:
+- 1000000
+- 1000001
+- 1000002
+- 1000003
+- 1000004
+eval_decodings: [rank, argmax, sample]
+select_decoding: rank
+keep_eval_checkpoints: true
+seed: 0
+output_dir: rl_runs/frontier_imitation
+wandb: false
+wandb_project: vidur-rl

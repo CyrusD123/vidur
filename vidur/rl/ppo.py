@@ -259,11 +259,16 @@ def _request_targets(
 ) -> Tuple[np.ndarray, np.ndarray]:
     obs = trajectory.transitions[index].obs
     row = request_returns[index]
+
+    def target(rid: int) -> float:
+        # warm-up calls (session_warmup) are not in the episode: no reward
+        return row[column[rid]] if rid in column else 0.0
+
     waiting = np.array(
-        [row[column[obs.request_ids[i]]] for i in modeled], dtype=np.float32
+        [target(obs.request_ids[i]) for i in modeled], dtype=np.float32
     )
     running = np.array(
-        [row[column[rid]] for rid in obs.running_request_ids[:max_running]],
+        [target(rid) for rid in obs.running_request_ids[:max_running]],
         dtype=np.float32,
     )
     return waiting, running

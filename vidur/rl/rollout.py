@@ -47,6 +47,9 @@ class WorkloadConfig:
     # (vidur/rl/frontier_env.py) with the `frontier` settings
     backend: str = "vidur"
     frontier: Dict[str, Any] = field(default_factory=dict)
+    # log mean_gap_closed (runs the oracle SJF reference on every seed; slow
+    # on Frontier, where starving SJF episodes run long); False logs NaN
+    gap_metric: bool = True
 
     def make_env(
         self,
@@ -76,6 +79,9 @@ class WorkloadConfig:
                 num_priority_levels,
             )
         assert self.backend == "vidur", f"unknown backend {self.backend!r}"
+        # only FrontierEnv leaves warm-up calls out of rewards and metrics
+        for key in ("session_warmup", "session_concurrency"):
+            assert not self.simulation.get(key), f"{key} needs backend=frontier"
         return VidurSchedulingEnv(config, reward_config, observation_config)
 
 
@@ -165,7 +171,11 @@ class RolloutRunner:
             request_ids=np.array([r.id for r in episode.requests], dtype=np.int64),
             cost=episode.cost,
             fcfs_cost=episode_cost(fcfs, env.reward_config, episode.request_thresholds),
-            mean_gap_closed=env.mean_gap_closed(episode, task.workload_seed),
+            mean_gap_closed=(
+                env.mean_gap_closed(episode, task.workload_seed)
+                if self._workloads[task.workload].gap_metric
+                else float("nan")
+            ),
             summary=episode.summary,
             decision_time_s=mean_decision_time(student),
         )

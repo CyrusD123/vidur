@@ -5,3 +5,4 @@ class RequestGeneratorType(BaseIntEnum):
     SYNTHETIC = 1
     TRACE_REPLAY = 2
     TRACE_WINDOW = 3
+    SESSION_TRACE = 4

@@ -20,6 +20,10 @@ if TYPE_CHECKING:
 #   ttft_hinge      ∫ #(no first token, age > τ_ttft) dt       = Σ max(0, TTFT - τ_ttft)
 #   e2e_hinge       ∫ #(in system, age > τ_e2e) dt            = Σ max(0, e2e - τ_e2e)
 #   starvation      ∫ Σ_no-first-token 2 max(0, age - τ_s) dt  = Σ max(0, TTFT - τ_s)²
+#   ttft_ref_sq     starvation with each request's own τ = max(ttft_ref_floor,
+#                   ttft_ref_k * its TTFT in the reference run (FCFS) of the same
+#                   workload): a call is charged only for waiting much longer than
+#                   FCFS made it wait (from agent-sessions-local)
 #   batch_time      Σ_batches execution time                   (counted when batches end;
 #                                                               not attributable to a request)
 REWARD_COMPONENTS = (
@@ -31,6 +35,7 @@ REWARD_COMPONENTS = (
     "ttft_hinge",
     "e2e_hinge",
     "starvation",
+    "ttft_ref_sq",
     "batch_time",
 )
 # components that are a sum over requests (all but batch_time)
@@ -59,6 +64,8 @@ THRESHOLD_MODES = ("fixed", "reference_window")
 
 # threshold name -> request id -> threshold
 RequestThresholds = Dict[str, Dict[int, float]]
+# per-request τ of ttft_ref_sq, from reference_ttft_thresholds
+TTFT_REF_THRESHOLD = "ttft_ref_threshold"
 
 
 @dataclass
@@ -106,6 +113,9 @@ class RewardConfig:
     ttft_threshold: Optional[float] = None
     e2e_threshold: Optional[float] = None
     starvation_threshold: Optional[float] = None
+    # ttft_ref_sq: τ_i = max(ttft_ref_floor, ttft_ref_k * reference TTFT_i)
+    ttft_ref_k: float = 2.0
+    ttft_ref_floor: float = 5.0
 
     calibration_quantile: Optional[float] = None
     calibration_seeds: Tuple[int, ...] = (1000, 1001, 1002)
@@ -263,6 +273,7 @@ class RewardTracker:
         self._ttft_hinge = HingeIntegral()
         self._e2e_hinge = HingeIntegral()
         self._starvation = HingeIntegral()
+        self._ttft_ref = HingeIntegral()
 
         self.token_times: List[float] = []
         self.token_request_ids: List[int] = []
@@ -292,6 +303,7 @@ class RewardTracker:
         acc["ttft_hinge"] += self._ttft_hinge.advance(t0, time)[0]
         acc["e2e_hinge"] += self._e2e_hinge.advance(t0, time)[0]
         acc["starvation"] += self._starvation.advance(t0, time)[1]
+        acc["ttft_ref_sq"] += self._ttft_ref.advance(t0, time)[1]
         self._time = time
 
     def on_request_arrival(self, request: Request) -> None:
@@ -312,6 +324,9 @@ class RewardTracker:
         self._starvation.add(
             request.id,
             self._crossing("starvation_threshold", self._starvation_threshold, request),
+        )
+        self._ttft_ref.add(
+            request.id, self._crossing(TTFT_REF_THRESHOLD, float("inf"), request)
         )
 
     def _crossing(self, name: str, default: float, request: Request) -> float:
@@ -339,6 +354,7 @@ class RewardTracker:
             self._num_without_first_token -= 1
             self._ttft_hinge.remove(request.id)
             self._starvation.remove(request.id)
+            self._ttft_ref.remove(request.id)
             gap = float("nan")
         else:
             gap = self._time - self._last_token_time[request.id]
@@ -390,6 +406,8 @@ def _request_arrays(
         default = _threshold(getattr(reward_config, name))
         per_request = request_thresholds.get(name, {})
         arrays[name] = row([per_request.get(r.id, default) for r in requests])
+    per_request = request_thresholds.get(TTFT_REF_THRESHOLD, {})
+    arrays[TTFT_REF_THRESHOLD] = row([per_request.get(r.id, np.inf) for r in requests])
     return arrays
 
 
@@ -412,6 +430,9 @@ def _overlap_components(
             "e2e_hinge": _overlap(arrived + arrays["e2e_threshold"], completed, t0, t1),
             "starvation": _squared_overlap(
                 arrived + arrays["starvation_threshold"], first_token, t0, t1
+            ),
+            "ttft_ref_sq": _squared_overlap(
+                arrived + arrays[TTFT_REF_THRESHOLD], first_token, t0, t1
             ),
         }
 
@@ -530,6 +551,22 @@ def window_thresholds(
             r.id: float(quantiles[start]) for r, start in zip(requests, starts)
         }
     return thresholds
+
+
+def reference_ttft_thresholds(
+    reference: "Episode", reward_config: RewardConfig
+) -> Dict[int, float]:
+    """ttft_ref_sq's per-request τ: max(ttft_ref_floor, ttft_ref_k * the
+    request's TTFT in the reference episode). Request ids match across runs of
+    the same workload; a request the reference never served gets none."""
+    return {
+        r.id: max(
+            reward_config.ttft_ref_floor,
+            reward_config.ttft_ref_k * (r.prefill_completed_at - r.arrived_at),
+        )
+        for r in reference.requests
+        if r.completed
+    }
 
 
 def per_request_rewards(episode: "Episode", reward_config: RewardConfig) -> np.ndarray:

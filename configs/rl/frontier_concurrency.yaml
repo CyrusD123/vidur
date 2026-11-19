@@ -1,0 +1,182 @@
+# Imitation of aging SJF, then PPO fine-tuning, on constant-concurrency
+# closed-loop agent workloads (Frontier, A100, Llama-3.1-8B, prefix caching):
+# rl_runs/run_frontier_concurrency.sh runs both stages and the CDF plots.
+#
+# Workloads: session_concurrency N simulated agents, each running sessions
+# back to back (next call after the previous response + think time). 600 s
+# of warm-up, then each agent's first ceil(num_requests / N) calls are scored
+# and the episode stops once they finish (vidur/rl/frontier_env.py), so a
+# policy that starves an agent cannot shrink that agent's share of the score.
+# Train: synthetic:random, base 18 agents x a 0.5-2x load draw (9-36 agents;
+# FCFS mean TTFT 1-200 s over 8 seeds). Eval: TraceLab / FreeInference at 12
+# and 20 agents (FCFS mean TTFT 23-124 s).
+#
+# Reward and teacher from the weight check (2026-11-18; 6 baselines, real
+# traces at 12/20 agents x 3 seeds, synthetic x 8 seeds). Improvement over FCFS
+# under e2e_normalized + w * ttft_hinge, mean over the 4 real workloads (worst):
+#                 w=0              0.003            0.01             0.02
+#   age200   +0.093 (-0.045)  +0.056 (-0.133)  -0.028 (-0.335)  -0.143 (-0.612)
+#   age400   +0.047 (-0.009)  +0.028 (-0.050)  -0.016 (-0.142)  -0.076 (-0.270)
+#   age1600  -0.001 (-0.120)  -0.003 (-0.123)  -0.008 (-0.131)  -0.014 (-0.142)
+#   plain    -0.359 (-0.950)  -0.495           -0.808           -1.237
+# (synthetic at w=0.01: age200 +0.067, age400 +0.053, age800 +0.038)
+# Teacher age200: the largest mean gain over FCFS (mean e2e -3% to -11%, mean
+# TTFT -11% to -27%), but p99 TTFT +77% to +136%. w=0.01 is ~1.7x the
+# teacher's break-even (~0.006) on the real traces: copying the teacher scores
+# slightly below FCFS there, so PPO must cut the tail, while the mean gain is
+# still worth keeping (at 0.02+ FCFS-like policies win and PPO drifts to FCFS).
+# Slower-aging SJF (age800/1600) is no shortcut: closer to FCFS order, yet
+# mean e2e +2-9% vs FCFS with more restarts and a lower prefix hit rate.
+# No e2e_hinge: the teacher's p99 e2e is within ~2% of FCFS's (its starvation
+# shows in TTFT), so e2e_hinge mostly rewards it (+0.01 e2e_hinge on top of
+# 0.01 ttft_hinge lifts age200 from -0.028 to -0.008, above age400/1600),
+# diluting the starvation signal. Cache-eviction costs are caught by the mean
+# term: age800/1600 already lose to FCFS at w=0.
+workloads:
+- name: synthetic_random
+  trace: synthetic:random
+  arrivals: sessions
+  num_requests: 200
+  num_blocks: 28318
+  weight: 1.0
+  gap_metric: false
+  simulation:
+    max_tokens: 131072
+    session_concurrency: 18
+    session_warmup: 600
+  backend: frontier
+  frontier: &frontier
+    model: llama3.1-8b
+    device: a100
+    network_device: a100_dgx
+    # the A100 profile has no CPU-overhead tables
+    model_cpu_overhead: false
+    prediction_rounding_bits: 5
+    enable_prefix_caching: true
+    extra_args:
+    - --vllm_v1_scheduler_config_max_model_len
+    - '131072'
+    - --random_forrest_execution_time_predictor_config_prediction_max_batch_size
+    - '256'
+eval_workloads:
+- name: tracelab_c12
+  trace: tracelab
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 28318
+  gap_metric: false
+  simulation: &sim12
+    max_tokens: 131072
+    session_concurrency: 12
+    session_warmup: 600
+  backend: frontier
+  frontier: *frontier
+- name: tracelab_c20
+  trace: tracelab
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 28318
+  gap_metric: false
+  simulation: &sim20
+    max_tokens: 131072
+    session_concurrency: 20
+    session_warmup: 600
+  backend: frontier
+  frontier: *frontier
+- name: freeinference_c12
+  trace: freeinference
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 28318
+  gap_metric: false
+  simulation: *sim12
+  backend: frontier
+  frontier: *frontier
+- name: freeinference_c20
+  trace: freeinference
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 28318
+  gap_metric: false
+  simulation: *sim20
+  backend: frontier
+  frontier: *frontier
+observation:
+  prefix_cache: true
+reward:
+  weights:
+    e2e_normalized: 1.0
+    ttft_hinge: 0.01
+  threshold_mode: reference_window
+  calibration_quantile: 0.95
+  # one threshold per episode (FCFS's q95 TTFT)
+  reference_window_requests: 100000
+  normalize_by_baselines:
+  - fcfs
+model:
+  encoder: transformer
+  head: ordinal
+  d_model: 64
+  num_layers: 2
+  num_heads: 4
+  shared_trunk: false
+  max_queue_len: 128
+  max_running_len: 128
+  init_middle_level_prob: 0.25
+# DAgger, sized for ~1.7 h on 4 workers (with 4 in parallel, training
+# episodes take ~150 s, eval episodes ~300 s; each training seed also runs its
+# FCFS reference): teacher eval, 20 teacher + 2 * 12 mixture rollouts, one
+# eval at the end. Light synthetic draws (mean TTFT < 5 s) give few decisions;
+# loaded ones ~900 each.
+imitation:
+  teacher: sjf_prefill_tokens_age200
+  iterations: 2
+  initial_seeds: 20
+  seeds_per_iteration: 12
+  beta_start: 0.5
+  beta_decay: 0.5
+  collect_decoding: argmax
+  epochs_per_iteration: 2
+  eval_every: 2
+  learning_rate: 0.0003
+  minibatch_size: 128
+  level_coef: 1.0
+  rank_coef: 1.0
+  max_dataset_size: 100000
+ppo:
+  imitation_coef: 0.1
+  learning_rate: 0.0001
+  clip: 0.2
+  epochs: 4
+  minibatch_size: 128
+  tau_s: 25.0
+  gae_lambda: 0.95
+  advantage: group
+  advantage_normalization: workload
+  value_coef: 0.5
+  request_value_coef: 0.5
+  entropy_coef: 0.001
+  max_grad_norm: 0.5
+  target_kl: 0.05
+  device: auto
+  bucket_by_length: true
+num_priority_levels: 16
+# PPO sized for ~6.5 h: 6 seeds x 4 rollouts (+ 6 FCFS references) per
+# iteration, ~20 min; eval (argmax only, ~15 min) every 4 iterations
+iterations: 16
+seeds_per_iteration: 6
+group_size: 4
+# at most 4 Frontier simulations at once (16 GB RAM)
+num_workers: 4
+eval_every: 4
+eval_seeds:
+- 1000000
+- 1000001
+- 1000002
+eval_decodings: [argmax]
+select_decoding: argmax
+keep_eval_checkpoints: true
+seed: 0
+output_dir: rl_runs/frontier_concurrency
+wandb: false
+wandb_project: vidur-rl

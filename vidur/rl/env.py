@@ -3,6 +3,7 @@ import copy
 import dataclasses
 import heapq
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -16,6 +17,7 @@ from vidur.config import (
     ReplicaConfig,
     RlVllmSchedulerConfig,
     SimulationConfig,
+    SessionTraceRequestGeneratorConfig,
     SyntheticRequestGeneratorConfig,
     TraceRequestLengthGeneratorConfig,
     TraceWindowRequestGeneratorConfig,
@@ -42,6 +44,8 @@ from vidur.rl.reward import (
     episode_cost_components,
     episode_metric_samples,
     window_thresholds,
+    TTFT_REF_THRESHOLD,
+    reference_ttft_thresholds,
     zero_components,
 )
 from vidur.scheduler.replica_scheduler.priority_policy import BasePriorityPolicy
@@ -600,6 +604,15 @@ class VidurSchedulingEnv:
                 request_generator_config,
             )
             context.request_thresholds = window_thresholds(reference, reward_config)
+        if reward_config.weights.get("ttft_ref_sq"):
+            reference = self.reference_episode(
+                reward_config.threshold_reference,
+                workload_seed,
+                request_generator_config,
+            )
+            context.request_thresholds[TTFT_REF_THRESHOLD] = reference_ttft_thresholds(
+                reference, reward_config
+            )
 
         if reward_config.normalize_by_baselines is not None:
             for baseline in reward_config.normalize_by_baselines:
@@ -736,6 +749,23 @@ TRACE_FILES = {
     "arxiv": "./data/processed_traces/arxiv_summarization_stats_llama2_tokenizer_filtered_v2.csv",
 }
 
+# Session traces with block hashes for prefix caching, built and sampled by
+# Frontier (frontier/trace_prep), so for arrivals="sessions" with the
+# frontier backend. Paths are under $FRONTIER_ROOT (default ../Frontier).
+SESSION_TRACE_FILES = {
+    "freeinference": "data/processed_traces/freeinference_2026-08-30_128k.csv",
+    "tracelab": "data/processed_traces/tracelab_coding_128k.csv",
+    "sharegpt_multiturn": "data/processed_traces/sharegpt_multiturn_llama3_4k.csv",
+}
+
+
+def _session_trace_file(name: str) -> str:
+    if name not in SESSION_TRACE_FILES:
+        return name
+    from vidur.request_generator.session_trace_request_generator import FRONTIER_ROOT
+
+    return os.path.join(FRONTIER_ROOT, SESSION_TRACE_FILES[name])
+
 
 def make_request_generator_config(
     trace_file: str = "azure_conv",
@@ -744,6 +774,13 @@ def make_request_generator_config(
     num_requests: int = 300,
     max_tokens: int = 4096,
     seed: int = 42,
+    session_time_scale: float = 1.0,
+    turn_gap: float = 30.0,
+    session_phase: str = "stationary",
+    session_closed_loop: bool = True,
+    session_warmup: float = 0.0,
+    session_concurrency: int = 0,
+    session_gap: float = 30.0,
 ) -> BaseRequestGeneratorConfig:
     """
     The workload: request lengths from `trace_file` (a TRACE_FILES name or a
@@ -752,8 +789,28 @@ def make_request_generator_config(
       arrivals="trace":   a seed-picked window of num_requests consecutive
                           requests replayed with their real arrival times,
                           time scaled so the whole trace averages qps
-                          (None = native rate).
+                          (None = native rate);
+      arrivals="sessions": num_requests calls at qps from a session trace
+                          (SESSION_TRACE_FILES name or path), whole sessions
+                          with their own gaps and block hashes, for Frontier's
+                          prefix cache (frontier/trace_prep/sessions.py).
     """
+    if arrivals == "sessions":
+        assert qps, "arrivals=sessions needs a qps"
+        return SessionTraceRequestGeneratorConfig(
+            seed=seed,
+            trace_file=_session_trace_file(trace_file),
+            num_requests=num_requests,
+            qps=qps,
+            max_tokens=max_tokens,
+            session_time_scale=session_time_scale,
+            turn_gap=turn_gap,
+            session_phase=session_phase,
+            session_closed_loop=session_closed_loop,
+            session_warmup=session_warmup,
+            session_concurrency=session_concurrency,
+            session_gap=session_gap,
+        )
     trace_file = TRACE_FILES.get(trace_file, trace_file)
     if arrivals == "trace":
         return TraceWindowRequestGeneratorConfig(
@@ -796,6 +853,13 @@ def make_simulation_config(
     rerank_interval_s: float = 0.1,
     seed: int = 42,
     output_dir: str = "simulator_output",
+    session_time_scale: float = 1.0,
+    turn_gap: float = 30.0,
+    session_phase: str = "stationary",
+    session_closed_loop: bool = True,
+    session_warmup: float = 0.0,
+    session_concurrency: int = 0,
+    session_gap: float = 30.0,
 ) -> SimulationConfig:
     """
     Single-replica rl_vllm config with the workload from
@@ -831,6 +895,13 @@ def make_simulation_config(
             num_requests=num_requests,
             max_tokens=max_tokens,
             seed=seed,
+            session_time_scale=session_time_scale,
+            turn_gap=turn_gap,
+            session_phase=session_phase,
+            session_closed_loop=session_closed_loop,
+            session_warmup=session_warmup,
+            session_concurrency=session_concurrency,
+            session_gap=session_gap,
         ),
         metrics_config=MetricsConfig(
             write_metrics=False,

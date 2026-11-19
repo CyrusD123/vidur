@@ -177,7 +177,7 @@ def trajectory_metrics(
             return float(np.mean(values)) if values else float("nan")
 
         agreement = agreement_metrics([x for t in group for x in t.transitions])
-        return {
+        out = {
             **{k: v for k, v in agreement.items() if np.isfinite(v)},
             "return": mean([t.total_reward for t in group]),
             "improvement_over_fcfs": mean([t.improvement_over_fcfs for t in group]),
@@ -189,6 +189,12 @@ def trajectory_metrics(
             "p99_tbt": mean([t.summary["p99_tbt"] for t in group]),
             "decision_ms": 1e3 * mean([t.decision_time_s for t in group]),
         }
+        # Frontier session workloads (vidur/rl/frontier_env.py)
+        for key in OPTIONAL_SUMMARY_KEYS:
+            values = [t.summary[key] for t in group if key in t.summary]
+            if values:
+                out[key] = mean(values)
+        return out
 
     metrics = {f"{prefix}/{k}": v for k, v in summarize(trajectories).items()}
     if len(by_workload) > 1:
@@ -199,6 +205,14 @@ def trajectory_metrics(
 
 
 # --- training loop ---------------------------------------------------------------
+
+OPTIONAL_SUMMARY_KEYS = (
+    "mean_session_serving",
+    "p99_session_serving",
+    "mean_session_jct",
+    "p99_session_jct",
+    "prefix_hit_rate",
+)
 
 
 class Trainer:

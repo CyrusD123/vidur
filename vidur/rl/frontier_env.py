@@ -34,8 +34,10 @@ VIDUR_FRONTIER_FAST_FOREST=0 to keep sklearn's.
 
 import copy
 import hashlib
+from collections import deque
 import os
 import sys
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from math import ceil
@@ -49,7 +51,7 @@ from vidur.entities.replica import Replica
 from vidur.request_generator import RequestGeneratorRegistry
 from vidur.rl import fast_forest
 from vidur.rl.action import admission_action_bounds
-from vidur.rl.agents import BaseAgent
+from vidur.rl.agents import BaseAgent, OracleAgent
 from vidur.rl.env import (
     Episode,
     Transition,
@@ -91,6 +93,7 @@ from frontier.rl.env import (  # noqa: E402
     _working_dir,
 )
 from frontier.rl.env import make_simulation_config as frontier_config  # noqa: E402
+from frontier.rl.observation import prefix_cache_view  # noqa: E402
 from frontier.rl.scheduler import (  # noqa: E402
     PriorityPolicy,
     RLVLLMv1EngineReplicaScheduler,
@@ -127,9 +130,18 @@ class FrontierFeatureScheduler(RLVLLMv1EngineReplicaScheduler):
     rankings.
     """
 
+    # admissions the recent prefix-cache hit rate covers
+    HIT_RATE_WINDOW = 32
+    # Block ids reach Frontier only from SessionTraceRequestGenerator, whose
+    # frontier/trace_prep ids are chained: prefix-cache lookups for features
+    # can binary search (KVCacheManager.peek_prefix_cache)
+    chained_block_hashes = True
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.history: Dict[int, RequestHistory] = {}
+        # (cached, prompt) tokens of recent first admissions
+        self._recent_hits: deque = deque(maxlen=self.HIT_RATE_WINDOW)
         self._windows = {
             (metric, window): SlidingWindow(size)
             for metric in WINDOW_METRICS
@@ -152,6 +164,25 @@ class FrontierFeatureScheduler(RLVLLMv1EngineReplicaScheduler):
         if batch:
             self._record("batch_num_tokens", batch.total_num_tokens)
         return batch
+
+    def _schedule_waiting_requests(self, token_budget: int):
+        result = super()._schedule_waiting_requests(token_budget)
+        for request in result[1]:
+            # a first admission (restarts keep their first hit)
+            if request.get_total_preemption_count() == 0:
+                self._recent_hits.append(
+                    (request.num_prefill_tokens_cached, request.num_prefill_tokens)
+                )
+        return result
+
+    @property
+    def recent_prefix_hit_rate(self) -> float:
+        """Prompt tokens served from the prefix cache over all prompt tokens,
+        for the last HIT_RATE_WINDOW admitted requests (vLLM's
+        PrefixCacheStats); 0 before any admission or without caching."""
+        cached = sum(c for c, _ in self._recent_hits)
+        prompt = sum(p for _, p in self._recent_hits)
+        return cached / prompt if prompt else 0.0
 
     def on_batch_end(self, batch) -> None:
         self._record("batch_time", batch.completed_at - batch.scheduled_at)
@@ -185,9 +216,21 @@ class _RequestView:
     num_restarts: int
     is_prefill_complete: bool
     prefill_completed_at: float
+    # waiting requests: prompt tokens Frontier's prefix cache holds now, how
+    # many blocks of that hit no running request holds, and how many blocks
+    # will be allocated before the hit loses one (-1: none idle)
+    # (RLVLLMv1EngineReplicaScheduler.cache_state)
+    num_cached_prefill_tokens: int = 0
+    num_idle_cached_blocks: int = 0
+    evict_distance_blocks: int = -1
 
 
-def _view(request: FrontierRequest, waiting: bool, first_token_at: Dict[int, float]):
+def _view(
+    request: FrontierRequest,
+    waiting: bool,
+    first_token_at: Dict[int, float],
+    cache_state=(0, 0, -1),
+):
     prompt = request.num_prefill_tokens
     processed = request.num_processed_tokens
     if waiting:
@@ -204,7 +247,22 @@ def _view(request: FrontierRequest, waiting: bool, first_token_at: Dict[int, flo
         num_restarts=request.get_total_preemption_count(),
         is_prefill_complete=request.is_prefill_complete,
         prefill_completed_at=first_token_at.get(request.id, 0.0),
+        num_cached_prefill_tokens=int(cache_state[0]),
+        num_idle_cached_blocks=int(cache_state[1]),
+        evict_distance_blocks=int(cache_state[2]),
     )
+
+
+class _OracleRequest:
+    """A waiting Frontier request as oracle baselines see it, plus the prompt
+    tokens Frontier's prefix cache holds for it now (job_size subtracts them)."""
+
+    def __init__(self, request: FrontierRequest, num_cached_prefill_tokens: int) -> None:
+        self._request = request
+        self.num_cached_prefill_tokens = int(num_cached_prefill_tokens)
+
+    def __getattr__(self, name: str):
+        return getattr(self._request, name)
 
 
 class _SchedulerView:
@@ -233,6 +291,7 @@ class _SchedulerView:
         self.max_num_batched_tokens = scheduler.max_tokens_in_batch
         # requests holding KV cache, as in Vidur
         self.num_running_requests = len(scheduler._allocation_map)
+        self.recent_prefix_hit_rate = scheduler.recent_prefix_hit_rate
 
     @property
     def running_requests(self) -> List[_RequestView]:
@@ -278,20 +337,71 @@ class _BridgePolicy(PriorityPolicy):
         self.token_gaps: List[float] = []
         # (end time, duration, number of requests) per batch
         self.batches: List[tuple] = []
+        # session_concurrency: score each agent's first per_agent calls
+        # arriving after warmup_s (set_score_window), stopping the simulator
+        # once they all finish; a fixed quota per agent, so a policy that
+        # starves an agent cannot shrink that agent's share of the score
+        self._score_window = None
+        self._simulator = None
+        self._arrived: Dict[int, FrontierRequest] = {}
+        self.scored_ids: Optional[set] = None
+
+    def set_score_window(
+        self, simulator, warmup_s: float, per_agent: int, num_agents: int
+    ) -> None:
+        self._simulator = simulator
+        self._score_window = (float(warmup_s), int(per_agent), int(num_agents))
+
+    @property
+    def num_scored(self) -> int:
+        return self._score_window[1] * self._score_window[2]
+
+    def score_window_ids(self) -> set:
+        """Each agent's (session_id's) first per_agent calls arriving after warmup_s."""
+        warmup_s, per_agent, _ = self._score_window
+        late = [r for r in self._arrived.values() if float(r.arrived_at) >= warmup_s]
+        late.sort(key=lambda r: (float(r.arrived_at), r.id))
+        taken: Dict[Any, int] = {}
+        ids = set()
+        for r in late:
+            if taken.get(r.session_id, 0) < per_agent:
+                taken[r.session_id] = taken.get(r.session_id, 0) + 1
+                ids.add(r.id)
+        return ids
+
+    def _maybe_stop(self) -> None:
+        ids = self.score_window_ids()
+        if len(ids) == self.num_scored and all(i in self.completed_at for i in ids):
+            self.scored_ids = ids
+            self._simulator._terminate = True
 
     def get_priorities(self, waiting, scheduler):
         self._pending = None
+        if self._score_window is not None:
+            for r in waiting:
+                self._arrived.setdefault(r.id, r)
         # Vidur ranks only when there is something to reorder
         if len(waiting) < 2:
             return None
         rank_mask = [True] * len(waiting)
         view = _SchedulerView(scheduler, self._num_levels, self.first_token_at, rank_mask)
+        # one prefix-cache lookup per request, shared by features and oracles
+        cache_states = [prefix_cache_view(scheduler, r) for r in waiting]
         obs = build_observation(
-            [_view(r, True, self.first_token_at) for r in waiting],
+            [
+                _view(r, True, self.first_token_at, state)
+                for r, state in zip(waiting, cache_states)
+            ],
             view,
             self._observation_config,
         )
-        action, info = _act(self._agent, obs, waiting, view)
+        if isinstance(self._agent, OracleAgent):
+            oracle_waiting = [
+                _OracleRequest(r, state[0]) for r, state in zip(waiting, cache_states)
+            ]
+        else:
+            oracle_waiting = waiting
+        action, info = _act(self._agent, obs, oracle_waiting, view)
         assert action.shape == (len(waiting),)
         if self._agent.unbounded_priorities:
             assert action.min() >= 0, action
@@ -372,8 +482,12 @@ class _BridgePolicy(PriorityPolicy):
     def on_batch_end(self, batch) -> None:
         time = float(batch.completed_at)
         self.batches.append((time, time - float(batch.scheduled_at), batch.size))
+        finished = False
         for request in batch.requests:
             self.requests.setdefault(request.id, request)
+            if self._score_window is not None:
+                self._arrived.setdefault(request.id, request)
+                finished = finished or (request.completed and request.id not in self.completed_at)
             emitted = request.num_emitted_decode_tokens
             if request.id not in self.first_token_at:
                 if request.is_prefill_complete:
@@ -384,6 +498,8 @@ class _BridgePolicy(PriorityPolicy):
             self._emitted[request.id] = emitted
             if request.completed and request.id not in self.completed_at:
                 self.completed_at[request.id] = float(request.completed_at)
+        if finished:
+            self._maybe_stop()
 
     def _token(self, request_id: int, time: float, gap: float) -> None:
         self._last_token_at[request_id] = time
@@ -406,6 +522,37 @@ class RequestRecord:
     completed_at: float
     completed: bool
     num_restarts: int
+    # agent sessions (session traces): the call's session
+    session_id: Optional[int] = None
+    # prompt tokens its first admission found in the prefix cache
+    num_cached_prefill_tokens: int = 0
+
+
+def session_metrics(records: List[RequestRecord]) -> Dict[str, float]:
+    """Per-session latency over sessions whose calls all completed (from
+    agent-sessions-local): session_serving is the sum of a session's calls'
+    e2e times (its time waiting on the server; think and tool time are the
+    trace's, so differences between policies are scheduling), session_jct its
+    first arrival to last completion. Empty without session ids."""
+    sessions: Dict[int, List[RequestRecord]] = {}
+    for r in records:
+        if r.session_id is not None:
+            sessions.setdefault(r.session_id, []).append(r)
+    done = [calls for calls in sessions.values() if all(r.completed for r in calls)]
+    if not done:
+        return {}
+    serving = np.array([sum(r.completed_at - r.arrived_at for r in calls) for calls in done])
+    jct = np.array(
+        [max(r.completed_at for r in calls) - min(r.arrived_at for r in calls) for calls in done]
+    )
+    return {
+        "num_sessions": len(done),
+        "mean_session_serving": float(serving.mean()),
+        "p50_session_serving": float(np.quantile(serving, 0.5)),
+        "p99_session_serving": float(np.quantile(serving, 0.99)),
+        "mean_session_jct": float(jct.mean()),
+        "p99_session_jct": float(np.quantile(jct, 0.99)),
+    }
 
 
 def vidur_num_blocks(config: SimulationConfig) -> int:
@@ -419,6 +566,26 @@ def vidur_num_blocks(config: SimulationConfig) -> int:
     planner = MemoryPlanner(replica_config, Replica(replica_config, generator_config))
     blocks_per_sequence = generator_config.max_tokens // scheduler_config.block_size
     return int(blocks_per_sequence * planner.get_max_request_slots())
+
+
+def _drop_warmup(policy: "_BridgePolicy", warmup_ids) -> None:
+    """Leave warm-up calls (session_warmup) out of a finished episode: their
+    requests and tokens, and every decision and batch before the first scored
+    call arrives. They were simulated, so the server (queue, prefix cache)
+    the scored calls see is warm; later decisions still see and rank leftover
+    warm-up calls, which carry no reward."""
+    scored = [i for i in policy.requests if i not in warmup_ids]
+    assert scored, "every call is warm-up"
+    start = min(float(policy.requests[i].arrived_at) for i in scored)
+    policy.requests = {i: policy.requests[i] for i in scored}
+    policy.first_token_at = {i: t for i, t in policy.first_token_at.items() if i not in warmup_ids}
+    policy.completed_at = {i: t for i, t in policy.completed_at.items() if i not in warmup_ids}
+    keep = [k for k, i in enumerate(policy.token_request_ids) if i not in warmup_ids]
+    policy.token_times = [policy.token_times[k] for k in keep]
+    policy.token_request_ids = [policy.token_request_ids[k] for k in keep]
+    policy.token_gaps = [policy.token_gaps[k] for k in keep]
+    policy.batches = [b for b in policy.batches if b[0] >= start]
+    policy.transitions = [t for t in policy.transitions if t.time >= start]
 
 
 class FrontierEnv(VidurSchedulingEnv):
@@ -480,19 +647,31 @@ class FrontierEnv(VidurSchedulingEnv):
         )
         if workload_seed is not None:
             _set_workload_seed(generator_config, workload_seed)
-        key = hashlib.sha1(repr(generator_config).encode()).hexdigest()[:16]
+        # a rebuilt trace file must not reuse workloads sampled from the old one
+        trace_file = getattr(generator_config, "trace_file", None)
+        signature = ""
+        if trace_file and str(trace_file).startswith("synthetic"):
+            # generated: the generator's code is the trace
+            trace_file = os.path.join(FRONTIER_ROOT, "frontier", "trace_prep", "synthetic.py")
+        if trace_file and os.path.exists(trace_file):
+            stat = os.stat(trace_file)
+            signature = f"{stat.st_size}:{stat.st_mtime_ns}"
+        key = hashlib.sha1((repr(generator_config) + signature).encode()).hexdigest()[:16]
         path = os.path.join(self._trace_dir, f"{key}.csv")
         if not os.path.exists(path):
             requests = RequestGeneratorRegistry.get(
                 generator_config.get_type(), generator_config
             ).generate()
-            frame = pd.DataFrame(
-                {
-                    "arrived_at": [r.arrived_at for r in requests],
-                    "num_prefill_tokens": [r.num_prefill_tokens for r in requests],
-                    "num_decode_tokens": [r.num_decode_tokens for r in requests],
-                }
-            ).sort_values("arrived_at", kind="stable")
+            columns = {
+                "arrived_at": [r.arrived_at for r in requests],
+                "num_prefill_tokens": [r.num_prefill_tokens for r in requests],
+                "num_decode_tokens": [r.num_decode_tokens for r in requests],
+            }
+            # session traces (SessionTraceRequestGenerator): prefix cache keys
+            for name in ("session_id", "block_hash_ids", "think_time", "ids_cover_output", "warmup"):
+                if requests and hasattr(requests[0], name):
+                    columns[name] = [getattr(r, name) for r in requests]
+            frame = pd.DataFrame(columns).sort_values("arrived_at", kind="stable")
             temporary = f"{path}.{os.getpid()}.tmp"
             frame.to_csv(temporary, index=False)
             os.replace(temporary, path)
@@ -510,7 +689,17 @@ class FrontierEnv(VidurSchedulingEnv):
             reward_config, workload_seed, request_generator_config
         )
         trace = self.workload_trace(workload_seed, request_generator_config)
-        num_requests = len(pd.read_csv(trace))
+        frame = pd.read_csv(
+            trace, usecols=lambda c: c in ("arrived_at", "warmup", "session_id")
+        )
+        num_requests = len(frame)
+        # request ids are trace rows (see below); warm-up calls (session_warmup)
+        # are simulated but left out of the episode
+        warmup_ids = (
+            set(np.flatnonzero(frame["warmup"].to_numpy() > 0).tolist())
+            if "warmup" in frame
+            else set()
+        )
         spec = WorkloadSpec(
             name="vidur_workload",
             num_requests=num_requests,
@@ -532,11 +721,34 @@ class FrontierEnv(VidurSchedulingEnv):
                 simulator = _RLSimulator(config)
             [scheduler] = replica_schedulers(simulator)
             scheduler.set_priority_policy(policy)
+            generator_config = request_generator_config or self._config.request_generator_config
+            if getattr(generator_config, "session_concurrency", 0):
+                # agents = slots actually sampled (synthetic scales the count)
+                num_agents = int(frame["session_id"].nunique())
+                policy.set_score_window(
+                    simulator,
+                    generator_config.session_warmup,
+                    -(-generator_config.num_requests // num_agents),
+                    num_agents,
+                )
             simulator.run()
         end_time = float(simulator._time)
-        return self._episode(policy, end_time, reward_config, context)
+        if policy._score_window is not None:
+            # everything outside the scored window is warm-up or spill-over
+            scored = policy.scored_ids or policy.score_window_ids()
+            if len(scored) < policy.num_scored:
+                warnings.warn(
+                    f"session_concurrency: only {len(scored)} of {policy.num_scored} "
+                    f"calls arrived after the warm-up; raise CONCURRENT_OVERPROVISION"
+                )
+            warmup_ids = set(policy.requests) - scored
+        return self._episode(policy, end_time, reward_config, context, warmup_ids)
 
-    def _episode(self, policy: _BridgePolicy, end_time, reward_config, context):
+    def _episode(
+        self, policy: _BridgePolicy, end_time, reward_config, context, warmup_ids=frozenset()
+    ):
+        if warmup_ids:
+            _drop_warmup(policy, warmup_ids)
         requests = [policy.requests[i] for i in sorted(policy.requests)]
         records = [
             RequestRecord(
@@ -548,6 +760,8 @@ class FrontierEnv(VidurSchedulingEnv):
                 completed_at=policy.completed_at.get(r.id, end_time),
                 completed=r.id in policy.completed_at,
                 num_restarts=int(r.get_total_preemption_count()),
+                session_id=None if r.session_id is None else int(r.session_id),
+                num_cached_prefill_tokens=int(r.num_prefill_tokens_cached),
             )
             for r in requests
         ]
@@ -594,4 +808,9 @@ class FrontierEnv(VidurSchedulingEnv):
         episode.cost = episode_cost(episode, reward_config)
         episode.summary = _summarize(episode, end_time)
         episode.summary["num_preemptions"] = int(sum(r.num_restarts for r in records))
+        episode.summary.update(session_metrics(records))
+        prompt = sum(r.num_prefill_tokens for r in records)
+        episode.summary["prefix_hit_rate"] = (
+            sum(r.num_cached_prefill_tokens for r in records) / prompt if prompt else 0.0
+        )
         return episode

@@ -81,17 +81,25 @@ def job_size(request: Request, key: str, max_num_batched_tokens: int) -> int:
       decode_tokens  output tokens still to generate
       iterations     scheduler iterations it needs on its own: chunked prefill
                      iterations plus one per output token
-      prefill_tokens prompt tokens only: not an oracle, a server knows it
+      prefill_tokens prompt tokens still to compute (no oracle: a server knows
+                     them), i.e. uncached-prompt SJF with a prefix cache
 
     A preempted request restarts with its generated tokens folded into the
     prompt, so these stay the remaining work after a restart.
+
+    Prompt tokens a prefix cache already holds (num_cached_prefill_tokens, set
+    by vidur/rl/frontier_env.py for Frontier's cache; 0 for Vidur requests)
+    are not work: a 120k prompt with 119k cached is a 1k-token prefill.
     """
+    prefill = request.num_prefill_tokens - getattr(request, "num_cached_prefill_tokens", 0)
     if key == "total_tokens":
-        return request.num_prefill_tokens + request.num_decode_tokens
+        return prefill + request.num_decode_tokens
     if key == "decode_tokens":
         return request.num_decode_tokens
+    if key == "prefill_tokens":
+        return max(prefill, 0)
     if key == "iterations":
-        prefill_iterations = -(-request.num_prefill_tokens // max_num_batched_tokens)
+        prefill_iterations = -(-prefill // max_num_batched_tokens)
         return prefill_iterations + request.num_decode_tokens
     if key == "prefill_tokens":
         return request.num_prefill_tokens

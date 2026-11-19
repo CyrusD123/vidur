@@ -139,6 +139,120 @@ def _blocks_needed_over_free(ctx):
     ]
 
 
+# --- prefix caching (Frontier backend; all 0 without a prefix cache) -------
+#
+# A waiting request's cache hit is read the way vLLM's admission reads it:
+# the leading prompt blocks whose chained hashes are in the cache now, capped
+# so at least the last prompt token is computed
+# (KVCacheManager.peek_prefix_cache, set on the request view by
+# vidur/rl/frontier_env.py). On a real server this is the lookup
+# get_computed_blocks already does for the head of the queue; done for every
+# waiting request it is one dict lookup per block (or O(log blocks) with a
+# binary search over the hash chain, since LRU eviction of tail-first freed
+# blocks leaves cached prefixes contiguous).
+
+
+def _cached_tokens(r) -> int:
+    return getattr(r, "num_cached_prefill_tokens", 0)
+
+
+def _uncached_tokens(r) -> int:
+    # the prefill admission would actually compute (a restart recomputes its
+    # generated tokens too: num_prefill_tokens covers them on the view)
+    return max(r.num_prefill_tokens - _cached_tokens(r), 0)
+
+
+def _uncached_blocks(r, block_size: int) -> int:
+    return max(ceil(r.num_prefill_tokens / block_size) - _cached_tokens(r) // block_size, 0)
+
+
+@waiting_feature("num_cached_prefill_tokens", transform="log1p")
+def _num_cached_prefill_tokens(ctx):
+    return [_cached_tokens(r) for r in ctx.waiting_requests]
+
+
+@waiting_feature("num_uncached_prefill_tokens", transform="log1p")
+def _num_uncached_prefill_tokens(ctx):
+    return [_uncached_tokens(r) for r in ctx.waiting_requests]
+
+
+@waiting_feature("cached_fraction")
+def _cached_fraction(ctx):
+    return [_cached_tokens(r) / max(1, r.num_prefill_tokens) for r in ctx.waiting_requests]
+
+
+@waiting_feature("num_uncached_blocks_needed", transform="log1p")
+def _num_uncached_blocks_needed(ctx):
+    # new KV blocks the whole prompt needs beyond its cache hit
+    block_size = ctx.scheduler.block_size
+    return [_uncached_blocks(r, block_size) for r in ctx.waiting_requests]
+
+
+@waiting_feature("alloc_blocks_over_free", transform="log1p")
+def _alloc_blocks_over_free(ctx):
+    # what admitting the whole prompt takes from the free pool, over the free
+    # pool: new blocks plus the hit's idle blocks, which are free-queue
+    # entries until admission takes them (vLLM's can_allocate_slots counts
+    # both). > 1: it cannot fully fit until memory frees up
+    block_size = ctx.scheduler.block_size
+    free = max(1, ctx.scheduler.num_free_blocks)
+    return [
+        (_uncached_blocks(r, block_size) + getattr(r, "num_idle_cached_blocks", 0)) / free
+        for r in ctx.waiting_requests
+    ]
+
+
+@waiting_feature("uncached_rank")
+def _uncached_rank(ctx):
+    # the shortest-uncached-prompt-first order, as a percentile
+    return _percentiles([_uncached_tokens(r) for r in ctx.waiting_requests])
+
+
+@waiting_feature("uncached_over_budget", transform="log1p")
+def _uncached_over_budget(ctx):
+    # prefill steps it needs at the full token budget: its service time in
+    # steps, the unit the policy trades waits in
+    budget = max(1, ctx.scheduler.max_num_batched_tokens)
+    return [_uncached_tokens(r) / budget for r in ctx.waiting_requests]
+
+
+# Eviction distance (RLVLLMv1EngineReplicaScheduler.cache_state): how many
+# blocks will be allocated before a waiting request's cached prefix loses a
+# block. vLLM evicts the free queue's head first, so this is the position of
+# the hit's first-evicted idle block in the free queue; a Fenwick tree over
+# queue sequence numbers keeps it at O(log blocks) per queue operation and
+# per query, and with chained hashes that block is the hit's last.
+
+
+def _evict_distance(r) -> int:
+    return getattr(r, "evict_distance_blocks", -1)
+
+
+@waiting_feature("has_evict_distance")
+def _has_evict_distance(ctx):
+    # its hit has blocks no running request holds (they can be evicted)
+    return [_evict_distance(r) >= 0 for r in ctx.waiting_requests]
+
+
+@waiting_feature("evict_distance_k", transform="log1p", scale=1e-3)
+def _evict_distance_k(ctx):
+    # thousands of blocks (0 when nothing can be evicted)
+    return [max(_evict_distance(r), 0) for r in ctx.waiting_requests]
+
+
+@waiting_feature("evict_over_queued")
+def _evict_over_queued(ctx):
+    # that distance over the blocks the queue's uncached prompts need, capped
+    # at 4 and scaled to [0, 1]: < 1/4 means serving the rest of the queue
+    # first would evict part of its hit
+    block_size = ctx.scheduler.block_size
+    queued = max(1, sum(_uncached_blocks(r, block_size) for r in ctx.waiting_requests))
+    return [
+        min(_evict_distance(r) / queued, 4.0) / 4.0 if _evict_distance(r) >= 0 else 0.0
+        for r in ctx.waiting_requests
+    ]
+
+
 @waiting_feature("queue_position")
 def _queue_position(ctx):
     n = len(ctx.waiting_requests)
@@ -262,6 +376,25 @@ def _num_running(ctx):
 @global_feature("free_block_fraction")
 def _free_block_fraction(ctx):
     return ctx.scheduler.num_free_blocks / ctx.scheduler.num_blocks
+
+
+@global_feature("waiting_uncached_tokens", transform="log1p")
+def _waiting_uncached_tokens(ctx):
+    # prefill work queued (cache hits excluded)
+    return sum(_uncached_tokens(r) for r in ctx.waiting_requests)
+
+
+@global_feature("waiting_cached_fraction")
+def _waiting_cached_fraction(ctx):
+    prompt = sum(r.num_prefill_tokens for r in ctx.waiting_requests)
+    return sum(_cached_tokens(r) for r in ctx.waiting_requests) / max(1, prompt)
+
+
+@global_feature("recent_prefix_hit_rate")
+def _recent_prefix_hit_rate(ctx):
+    # cached / prompt tokens of recently admitted requests; falls as sessions
+    # evict each other's prefixes (the cache cliff)
+    return getattr(ctx.scheduler, "recent_prefix_hit_rate", 0.0)
 
 
 # sliding-window history: {metric}_{mean,min,max}_{short,medium,long}

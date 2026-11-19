@@ -1,0 +1,149 @@
+# Train on randomized synthetic agent sessions, evaluate on real agentic
+# traces. Frontier, A100 80GB + Llama-3.1-8B (128k), prefix caching on, closed
+# loop.
+#
+# Training: synthetic:random (Frontier frontier/trace_prep/synthetic.py) draws a
+# fresh workload distribution per seed: system-prompt size and count, first
+# prompt, per-call context growth, outputs, think time, calls per session,
+# re-sent and restarting calls, all from ranges spanning both eval traces, and
+# the offered load from 0.5x-2x the workload's qps. Calls compact at 120k
+# tokens like the eval traces, and outputs are cached.
+#
+# Load: synthetic sessions load the server more than the real traces at the
+# same qps (synthetic think times are iid per call), so qps is matched by FCFS
+# behaviour, not number (2026-11-14 sweeps, 3 seeds, 150 calls):
+#   real tracelab q1 ~ synthetic:tracelab q0.5    (FCFS TTFT ~100-120 s)
+#   real tracelab q2 ~ synthetic:tracelab q2      (~290 s, SJF gain ~33%)
+#   real freeinference q1-2 ~ synthetic:freeinference q1 (~110-185 s)
+#   real freeinference q4 ~ synthetic:freeinference q2   (~380 s)
+# Evals (real traces at q1 and q2) have FCFS TTFT 100-300 s and oracle
+# SJF gains of 24-38%; below q1 FCFS ~ SJF.
+#
+# synthetic:random at base qps 1.5 (offered 0.75-3), 8 seeds: FCFS mean TTFT
+# 98-326 s (median 236), oracle SJF gain 17-48% (median 41%), hit rate
+# 0.28-0.54, 35-115 s per episode. At base qps 1 a few seeds are nearly idle
+# (TTFT 23 s, SJF gain 6%).
+#
+# The real traces are never trained on.
+workloads:
+- name: synthetic_random
+  trace: synthetic:random
+  arrivals: sessions
+  qps: 1.5
+  num_requests: 150
+  num_blocks: 28318
+  weight: 1.0
+  simulation: &sim
+    max_tokens: 131072
+  backend: frontier
+  frontier: &frontier
+    model: llama3.1-8b
+    device: a100
+    network_device: a100_dgx
+    # the A100 profile has no CPU-overhead tables
+    model_cpu_overhead: false
+    prediction_rounding_bits: 5
+    enable_prefix_caching: true
+    extra_args:
+    - --vllm_v1_scheduler_config_max_model_len
+    - '131072'
+    - --random_forrest_execution_time_predictor_config_prediction_max_batch_size
+    - '256'
+eval_workloads:
+- name: tracelab_q1
+  trace: tracelab
+  arrivals: sessions
+  qps: 1
+  num_requests: 150
+  num_blocks: 28318
+  weight: 1.0
+  simulation: *sim
+  backend: frontier
+  frontier: *frontier
+- name: tracelab_q2
+  trace: tracelab
+  arrivals: sessions
+  qps: 2
+  num_requests: 150
+  num_blocks: 28318
+  weight: 1.0
+  simulation: *sim
+  backend: frontier
+  frontier: *frontier
+- name: freeinference_q1
+  trace: freeinference
+  arrivals: sessions
+  qps: 1
+  num_requests: 150
+  num_blocks: 28318
+  weight: 1.0
+  simulation: *sim
+  backend: frontier
+  frontier: *frontier
+- name: freeinference_q2
+  trace: freeinference
+  arrivals: sessions
+  qps: 2
+  num_requests: 150
+  num_blocks: 28318
+  weight: 1.0
+  simulation: *sim
+  backend: frontier
+  frontier: *frontier
+observation:
+  prefix_cache: true
+reward:
+  weights:
+    e2e_normalized: 1.0
+    e2e_hinge: 0.3
+  threshold_mode: reference_window
+  calibration_quantile: 0.95
+  # larger than any episode: one threshold per episode, the 0.95 quantile of
+  # that seed's FCFS e2e. Matching calls to the FCFS run by id is unreliable
+  # under closed loop (SJF moves calls 40-48 places in arrival order at p90),
+  # and randomized loads rule out one fixed value (per-seed q95 221-941 s).
+  reference_window_requests: 100000
+  normalize_by_baselines:
+  - fcfs
+model:
+  encoder: transformer
+  head: ordinal
+  d_model: 64
+  num_layers: 2
+  num_heads: 4
+  shared_trunk: false
+  max_queue_len: 128
+  max_running_len: 128
+  init_middle_level_prob: 0.75
+ppo:
+  learning_rate: 0.0003
+  clip: 0.2
+  epochs: 4
+  minibatch_size: 128
+  tau_s: 25.0
+  gae_lambda: 0.95
+  advantage: group
+  advantage_normalization: workload
+  value_coef: 0.5
+  request_value_coef: 0.5
+  entropy_coef: 0.003
+  max_grad_norm: 0.5
+  target_kl: 0.05
+  device: auto
+  bucket_by_length: true
+num_priority_levels: 16
+iterations: 200
+seeds_per_iteration: 8
+group_size: 4
+num_workers: 3
+eval_every: 10
+eval_seeds:
+- 1000000
+- 1000001
+- 1000002
+- 1000003
+- 1000004
+seed: 0
+output_dir: rl_runs/frontier_synthetic
+wandb: false
+wandb_project: vidur-rl

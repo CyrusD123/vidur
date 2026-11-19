@@ -1,0 +1,122 @@
+# Agentic session traces with prefix caching on Frontier: A100 80GB +
+# Llama-3.1-8B (128k context; Frontier data/profiling/compute/a100/llama3.1-8b).
+# Traces are built by Frontier's frontier/trace_prep (README there) and named
+# in SESSION_TRACE_FILES (vidur/rl/env.py).
+#
+# arrivals: sessions overlays whole agent sessions, closed loop: a session's
+# next call arrives only after its previous call completes (plus the trace's
+# think time), while different sessions arrive independently. qps is the
+# offered load; the server throttles the achieved rate to ~0.06-0.10 calls/s.
+#
+# 128k context: the traces compact sessions to fit (frontier/trace_prep
+# README: at 120k tokens a context restarts as 16k), so no call exceeds
+# simulation.max_tokens (131072), which also sets Frontier's predictor limit
+# (prediction_max_tokens_per_request); max_model_len 131072 matches the
+# model's context. Trace ids cover outputs, which Frontier caches like vLLM.
+#
+# Loads from a closed-loop FCFS vs oracle SJF sweep (2 seeds, 150 calls, SJF
+# sized by uncached prompt tokens): below 0.2 offered qps FCFS = SJF (queues
+# never hold 2 calls); mean-e2e SJF gain over FCFS:
+#   tracelab       0.2: 11%   0.3: 11%   0.5: 25%
+#   freeinference  0.2:  4%   0.3: 14%   0.5:  5%
+workloads:
+- name: tracelab_q0.2
+  trace: tracelab
+  arrivals: sessions
+  qps: 0.2
+  num_requests: 150
+  num_blocks: 28318
+  weight: 1.0
+  simulation: &sim
+    max_tokens: 131072
+  backend: frontier
+  frontier: &frontier
+    model: llama3.1-8b
+    device: a100
+    network_device: a100_dgx
+    # the A100 profile has no CPU-overhead tables
+    model_cpu_overhead: false
+    prediction_rounding_bits: 5
+    enable_prefix_caching: true
+    extra_args:
+    - --vllm_v1_scheduler_config_max_model_len
+    - '131072'
+    - --random_forrest_execution_time_predictor_config_prediction_max_batch_size
+    - '256'
+- name: tracelab_q0.5
+  trace: tracelab
+  arrivals: sessions
+  qps: 0.5
+  num_requests: 150
+  num_blocks: 28318
+  weight: 1.0
+  simulation: *sim
+  backend: frontier
+  frontier: *frontier
+- name: freeinference_q0.3
+  trace: freeinference
+  arrivals: sessions
+  qps: 0.3
+  num_requests: 150
+  num_blocks: 28318
+  weight: 1.0
+  simulation: *sim
+  backend: frontier
+  frontier: *frontier
+eval_workloads: null
+# prefix-cache features (vidur/rl/observation.py PREFIX_CACHE_*): uncached
+# prompt tokens and blocks, cached fraction, admission memory cost, the
+# uncached-SJF rank, queued uncached work and the recent hit rate
+observation:
+  prefix_cache: true
+reward:
+  weights:
+    e2e_normalized: 1.0
+    e2e_hinge: 0.3
+  threshold_mode: reference_window
+  calibration_quantile: 0.95
+  reference_window_requests: 50
+  normalize_by_baselines:
+  - fcfs
+model:
+  encoder: transformer
+  head: ordinal
+  d_model: 64
+  num_layers: 2
+  num_heads: 4
+  shared_trunk: false
+  max_queue_len: 128
+  max_running_len: 128
+  init_middle_level_prob: 0.75
+ppo:
+  learning_rate: 0.0003
+  clip: 0.2
+  epochs: 4
+  minibatch_size: 128
+  tau_s: 25.0
+  gae_lambda: 0.95
+  advantage: group
+  advantage_normalization: workload
+  value_coef: 0.5
+  request_value_coef: 0.5
+  entropy_coef: 0.003
+  max_grad_norm: 0.5
+  target_kl: 0.05
+  device: auto
+  bucket_by_length: true
+num_priority_levels: 16
+iterations: 200
+seeds_per_iteration: 8
+group_size: 4
+num_workers: 3
+eval_every: 10
+eval_seeds:
+- 1000000
+- 1000001
+- 1000002
+- 1000003
+- 1000004
+seed: 0
+output_dir: rl_runs/frontier_run2
+wandb: false
+wandb_project: vidur-rl

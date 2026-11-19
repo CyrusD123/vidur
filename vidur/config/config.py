@@ -285,6 +285,77 @@ class TraceWindowRequestGeneratorConfig(BaseRequestGeneratorConfig):
 
 
 @dataclass
+class SessionTraceRequestGeneratorConfig(BaseRequestGeneratorConfig):
+    """
+    num_requests calls at qps sampled from a session trace with block hashes
+    (Frontier's frontier/trace_prep: whole sessions with their own call gaps,
+    overlaid at random phases; the seed picks sessions and phases). Requests
+    carry session_id and block_hash_ids for Frontier's prefix cache; Vidur's
+    own simulator ignores them (it has no prefix cache).
+    """
+
+    trace_file: str = field(
+        default="",
+        metadata={"help": "Session trace CSV (frontier.trace_prep)."},
+    )
+    num_requests: int = field(
+        default=300,
+        metadata={"help": "Number of calls in the window."},
+    )
+    qps: float = field(
+        default=1.0,
+        metadata={"help": "Call rate of the window."},
+    )
+    max_tokens: int = field(
+        default=131072,
+        metadata={"help": "Drop calls whose prompt + output exceed this."},
+    )
+    session_time_scale: float = field(
+        default=1.0,
+        metadata={"help": "Scale each session's gaps between calls."},
+    )
+    turn_gap: float = field(
+        default=30.0,
+        metadata={"help": "Mean think time between turns for traces without times."},
+    )
+    session_phase: str = field(
+        default="stationary",
+        metadata={"help": "stationary (sessions already running) or start."},
+    )
+    session_closed_loop: bool = field(
+        default=True,
+        metadata={
+            "help": "A session's next call waits for its previous one to complete "
+            "(Frontier only; Vidur's simulator replays the sampled times)."
+        },
+    )
+    session_warmup: float = field(
+        default=0.0,
+        metadata={
+            "help": "Seconds of warm-up calls before the num_requests scored ones, "
+            "simulated but left out of rewards and metrics (Frontier only)."
+        },
+    )
+    session_concurrency: int = field(
+        default=0,
+        metadata={
+            "help": "If > 0, a closed system of this many agents running sessions back "
+            "to back (frontier.trace_prep.sessions.sample_concurrent_workload) "
+            "instead of a qps window; num_requests calls are scored, the first "
+            "arriving after session_warmup seconds of simulated time (Frontier only)."
+        },
+    )
+    session_gap: float = field(
+        default=30.0,
+        metadata={"help": "With session_concurrency: mean gap before an agent's next session."},
+    )
+
+    @staticmethod
+    def get_type():
+        return RequestGeneratorType.SESSION_TRACE
+
+
+@dataclass
 class BaseReplicaSchedulerConfig(BasePolyConfig):
     batch_size_cap: int = field(
         default=128,

@@ -33,9 +33,32 @@ DEFAULT_WAITING_FEATURES = (
     "has_priority",
     "to_rank",
 )
+# Prefix-cache features (vidur/rl/features.py), 0 without a prefix cache.
+# Not in the defaults, so configs (and checkpoints) without them keep their
+# input sizes; ObservationConfig(prefix_cache=True) appends them.
+PREFIX_CACHE_WAITING_FEATURES = (
+    "num_uncached_prefill_tokens",
+    "num_cached_prefill_tokens",
+    "cached_fraction",
+    "num_uncached_blocks_needed",
+    "alloc_blocks_over_free",
+    "uncached_rank",
+    "uncached_over_budget",
+    "has_evict_distance",
+    "evict_distance_k",
+    "evict_over_queued",
+)
+PREFIX_CACHE_GLOBAL_FEATURES = (
+    "waiting_uncached_tokens",
+    "waiting_cached_fraction",
+    "recent_prefix_hit_rate",
+)
 DEFAULT_RUNNING_FEATURES = tuple(RUNNING_FEATURES)
-# everything registered: counts, free memory, and all sliding-window statistics
-DEFAULT_GLOBAL_FEATURES = tuple(GLOBAL_FEATURES)
+# everything registered but the prefix-cache features: counts, free memory,
+# and all sliding-window statistics
+DEFAULT_GLOBAL_FEATURES = tuple(
+    name for name in GLOBAL_FEATURES if name not in PREFIX_CACHE_GLOBAL_FEATURES
+)
 
 
 def _lookup(registry, names, kind) -> Tuple[Feature, ...]:
@@ -46,11 +69,13 @@ def _lookup(registry, names, kind) -> Tuple[Feature, ...]:
 
 @dataclass
 class ObservationConfig:
-    """Which registered features (vidur/rl/features.py) the policy observes."""
+    """Which registered features (vidur/rl/features.py) the policy observes.
+    prefix_cache=True appends the prefix-cache features not already listed."""
 
     waiting_features: Tuple[str, ...] = DEFAULT_WAITING_FEATURES
     running_features: Tuple[str, ...] = DEFAULT_RUNNING_FEATURES
     global_features: Tuple[str, ...] = DEFAULT_GLOBAL_FEATURES
+    prefix_cache: bool = False
 
     _waiting: Tuple[Feature, ...] = field(init=False, repr=False)
     _running: Tuple[Feature, ...] = field(init=False, repr=False)
@@ -60,6 +85,13 @@ class ObservationConfig:
         self.waiting_features = tuple(self.waiting_features)
         self.running_features = tuple(self.running_features)
         self.global_features = tuple(self.global_features)
+        if self.prefix_cache:
+            self.waiting_features += tuple(
+                f for f in PREFIX_CACHE_WAITING_FEATURES if f not in self.waiting_features
+            )
+            self.global_features += tuple(
+                f for f in PREFIX_CACHE_GLOBAL_FEATURES if f not in self.global_features
+            )
         self._waiting = _lookup(WAITING_FEATURES, self.waiting_features, "waiting")
         self._running = _lookup(RUNNING_FEATURES, self.running_features, "running")
         self._global = _lookup(GLOBAL_FEATURES, self.global_features, "global")

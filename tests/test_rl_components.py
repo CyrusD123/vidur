@@ -30,7 +30,7 @@ from vidur.rl.env import (
     _set_workload_seed,
 )
 from vidur.rl.features import FeatureContext
-from vidur.rl.reward import PER_REQUEST_COMPONENTS, RewardTracker
+from vidur.rl.reward import PER_REQUEST_COMPONENTS, RewardTracker, episode_cost_components
 from vidur.scheduler.replica_scheduler.priority_policy import BasePriorityPolicy
 from vidur.scheduler.replica_scheduler.rl_vllm_replica_scheduler import SlidingWindow
 
@@ -409,3 +409,30 @@ def test_agent_policy_matches_recording_policy(env, random_episode):
     simulator.run()
     outcomes = [(r.id, r.completed_at) for r in simulator.requests]
     assert outcomes == [(r.id, r.completed_at) for r in random_episode.requests]
+
+
+def test_ttft_ref_sq_charges_waits_beyond_each_calls_fcfs_ttft(tmp_path_factory):
+    reward_config = RewardConfig(
+        weights={"e2e": 1.0, "ttft_ref_sq": 1.0}, ttft_ref_k=0.5, ttft_ref_floor=0.05
+    )
+    env = VidurSchedulingEnv(_config(tmp_path_factory), reward_config)
+    episode = env.run_episode(RandomAgent(seed=0), workload_seed=WORKLOAD_SEED)
+    reference = {
+        r.id: r.prefill_completed_at - r.arrived_at
+        for r in env.reference_episode("fcfs", WORKLOAD_SEED).requests
+    }
+    ttft = np.array([r.prefill_completed_at - r.arrived_at for r in episode.requests])
+    tau = np.array([max(0.05, 0.5 * reference[r.id]) for r in episode.requests])
+    expected = (np.maximum(0, ttft - tau) ** 2).sum()
+    assert expected > 0
+    # the online tracker, and the closed form from request timings
+    assert math.isclose(_episode_totals(episode)["ttft_ref_sq"], expected, rel_tol=1e-9)
+    assert math.isclose(
+        episode_cost_components(episode, reward_config)["ttft_ref_sq"], expected, rel_tol=1e-9
+    )
+    per_request = per_request_reward_components(episode, reward_config)["ttft_ref_sq"]
+    np.testing.assert_allclose(
+        per_request.sum(axis=1),
+        [t.reward_components["ttft_ref_sq"] for t in episode.transitions],
+        rtol=1e-7, atol=1e-9,
+    )

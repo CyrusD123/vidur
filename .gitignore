@@ -188,3 +188,10 @@ env_3
 
 # RL training runs (vidur/rl/train.py)
 # rl_runs/
+
+# RL run outputs that stay local (raw sims, intermediate checkpoints, rollout data)
+rl_runs/*/sim/
+rl_runs/frontier_*/latest.pt
+rl_runs/frontier_*/checkpoints/
+rl_runs/frontier_*_cdfs/data/
+rl_runs/frontier_cdf_plots/data/
