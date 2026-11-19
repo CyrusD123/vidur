@@ -1,0 +1,65 @@
+checkpoint: rl_runs/frontier_concurrency/best.pt
+seeds:
+- 1000000
+- 1000001
+- 1000002
+backend: frontier
+policies:
+- fcfs
+- sjf_prefill_tokens_age200
+- sjf_prefill_tokens
+- policy_argmax
+workloads:
+- name: tracelab_c12
+  trace: tracelab
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 28318
+  gap_metric: false
+  simulation: &id002
+    max_tokens: 131072
+    session_concurrency: 12
+    session_warmup: 600
+  backend: frontier
+  frontier: &id001
+    model: llama3.1-8b
+    device: a100
+    network_device: a100_dgx
+    model_cpu_overhead: false
+    prediction_rounding_bits: 5
+    enable_prefix_caching: true
+    extra_args:
+    - --vllm_v1_scheduler_config_max_model_len
+    - '131072'
+    - --random_forrest_execution_time_predictor_config_prediction_max_batch_size
+    - '256'
+- name: tracelab_c20
+  trace: tracelab
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 28318
+  gap_metric: false
+  simulation: &id003
+    max_tokens: 131072
+    session_concurrency: 20
+    session_warmup: 600
+  backend: frontier
+  frontier: *id001
+- name: freeinference_c12
+  trace: freeinference
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 28318
+  gap_metric: false
+  simulation: *id002
+  backend: frontier
+  frontier: *id001
+- name: freeinference_c20
+  trace: freeinference
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 28318
+  gap_metric: false
+  simulation: *id003
+  backend: frontier
+  frontier: *id001

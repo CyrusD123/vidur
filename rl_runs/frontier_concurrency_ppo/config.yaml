@@ -1,0 +1,190 @@
+workloads:
+- name: synthetic_random
+  trace: synthetic:random
+  arrivals: sessions
+  num_requests: 200
+  num_blocks: 28318
+  weight: 1.0
+  gap_metric: false
+  simulation:
+    max_tokens: 131072
+    session_concurrency: 18
+    session_warmup: 600
+  backend: frontier
+  frontier:
+    model: llama3.1-8b
+    device: a100
+    network_device: a100_dgx
+    model_cpu_overhead: false
+    prediction_rounding_bits: 5
+    enable_prefix_caching: true
+    extra_args:
+    - --vllm_v1_scheduler_config_max_model_len
+    - '131072'
+    - --random_forrest_execution_time_predictor_config_prediction_max_batch_size
+    - '256'
+eval_workloads:
+- name: tracelab_c12
+  trace: tracelab
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 28318
+  gap_metric: false
+  simulation:
+    max_tokens: 131072
+    session_concurrency: 12
+    session_warmup: 600
+  backend: frontier
+  frontier:
+    model: llama3.1-8b
+    device: a100
+    network_device: a100_dgx
+    model_cpu_overhead: false
+    prediction_rounding_bits: 5
+    enable_prefix_caching: true
+    extra_args:
+    - --vllm_v1_scheduler_config_max_model_len
+    - '131072'
+    - --random_forrest_execution_time_predictor_config_prediction_max_batch_size
+    - '256'
+- name: tracelab_c20
+  trace: tracelab
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 28318
+  gap_metric: false
+  simulation:
+    max_tokens: 131072
+    session_concurrency: 20
+    session_warmup: 600
+  backend: frontier
+  frontier:
+    model: llama3.1-8b
+    device: a100
+    network_device: a100_dgx
+    model_cpu_overhead: false
+    prediction_rounding_bits: 5
+    enable_prefix_caching: true
+    extra_args:
+    - --vllm_v1_scheduler_config_max_model_len
+    - '131072'
+    - --random_forrest_execution_time_predictor_config_prediction_max_batch_size
+    - '256'
+- name: freeinference_c12
+  trace: freeinference
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 28318
+  gap_metric: false
+  simulation:
+    max_tokens: 131072
+    session_concurrency: 12
+    session_warmup: 600
+  backend: frontier
+  frontier:
+    model: llama3.1-8b
+    device: a100
+    network_device: a100_dgx
+    model_cpu_overhead: false
+    prediction_rounding_bits: 5
+    enable_prefix_caching: true
+    extra_args:
+    - --vllm_v1_scheduler_config_max_model_len
+    - '131072'
+    - --random_forrest_execution_time_predictor_config_prediction_max_batch_size
+    - '256'
+- name: freeinference_c20
+  trace: freeinference
+  arrivals: sessions
+  num_requests: 300
+  num_blocks: 28318
+  gap_metric: false
+  simulation:
+    max_tokens: 131072
+    session_concurrency: 20
+    session_warmup: 600
+  backend: frontier
+  frontier:
+    model: llama3.1-8b
+    device: a100
+    network_device: a100_dgx
+    model_cpu_overhead: false
+    prediction_rounding_bits: 5
+    enable_prefix_caching: true
+    extra_args:
+    - --vllm_v1_scheduler_config_max_model_len
+    - '131072'
+    - --random_forrest_execution_time_predictor_config_prediction_max_batch_size
+    - '256'
+observation:
+  prefix_cache: true
+reward:
+  weights:
+    e2e_normalized: 1.0
+    ttft_hinge: 0.01
+  threshold_mode: reference_window
+  calibration_quantile: 0.95
+  reference_window_requests: 100000
+  normalize_by_baselines:
+  - fcfs
+model:
+  encoder: transformer
+  head: ordinal
+  d_model: 64
+  num_layers: 2
+  num_heads: 4
+  shared_trunk: false
+  max_queue_len: 128
+  max_running_len: 128
+  init_middle_level_prob: 0.25
+ppo:
+  imitation_coef: 0.1
+  learning_rate: 0.0001
+  clip: 0.2
+  epochs: 4
+  minibatch_size: 128
+  tau_s: 25.0
+  gae_lambda: 0.95
+  advantage: group
+  advantage_normalization: workload
+  value_coef: 0.5
+  request_value_coef: 0.5
+  entropy_coef: 0.001
+  max_grad_norm: 0.5
+  target_kl: 0.05
+  device: auto
+  bucket_by_length: true
+imitation:
+  teacher: sjf_prefill_tokens_age200
+  iterations: 2
+  initial_seeds: 20
+  seeds_per_iteration: 12
+  beta_start: 0.5
+  beta_decay: 0.5
+  collect_decoding: argmax
+  epochs_per_iteration: 2
+  eval_every: 2
+  learning_rate: 0.0003
+  minibatch_size: 128
+  level_coef: 1.0
+  rank_coef: 1.0
+  max_dataset_size: 100000
+init_checkpoint: rl_runs/frontier_concurrency/best.pt
+num_priority_levels: 16
+iterations: 16
+seeds_per_iteration: 6
+group_size: 4
+num_workers: 4
+eval_every: 4
+eval_decodings:
+- argmax
+select_decoding: argmax
+keep_eval_checkpoints: true
+eval_seeds:
+- 1000000
+- 1000001
+- 1000002
+seed: 0
+output_dir: rl_runs/frontier_concurrency_ppo
+wandb: false
+wandb_project: vidur-rl
