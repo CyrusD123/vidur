@@ -1,3 +1,13 @@
+"""
+RL scheduling on Vidur's simulator, and on Frontier's (frontier_env.py).
+
+Moved: the Frontier-backed stack now lives in the Frontier repo as
+frontier/rl/sched (python -m frontier.rl.sched.train / .imitation /
+.plot_cdfs), with configs/rl/frontier_*.yaml and scripts/rl/. Continue there;
+this copy is kept as the reference for the Vidur-simulator backend and for the
+results committed under rl_runs/.
+"""
+
 from vidur.rl.action import admission_action_bounds
 from vidur.rl.agents import (
     BaseAgent,
